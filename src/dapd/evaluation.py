@@ -64,6 +64,16 @@ def evaluate_model(
         warmup_runs=int(getattr(config, "latency_warmup_runs", 10)),
         timed_runs=int(getattr(config, "latency_benchmark_runs", 100)),
     )
+    latency_by_seq_len = _benchmark_latency_by_seq_len(
+        model=student_model,
+        tokenizer=student_tokenizer,
+        prompts=eval_prompts,
+        seq_lens=_resolve_latency_seq_lens(config),
+        max_new_tokens=config.max_new_tokens,
+        device=device,
+        warmup_runs=int(getattr(config, "latency_warmup_runs", 10)),
+        timed_runs=int(getattr(config, "latency_benchmark_runs", 100)),
+    )
     calibration = _compute_token_calibration_metrics(
         model=student_model,
         tokenizer=student_tokenizer,
@@ -104,6 +114,7 @@ def evaluate_model(
         "tokens_processed": perf["tokens_processed"],
         "inference_time_sec": perf["inference_time_sec"],
         "samples_measured": int(perf["samples"]),
+        "latency_by_seq_len": latency_by_seq_len,
         "expected_calibration_error": calibration["expected_calibration_error"],
         "brier_score": calibration["brier_score"],
         "memory_usage": memory_usage,
@@ -128,6 +139,7 @@ def evaluate_model(
         out["teacher_throughput_tokens_per_sec"] = ref["throughput_tokens_per_sec"]
         out["teacher_tokens_processed"] = ref["tokens_processed"]
         out["teacher_inference_time_sec"] = ref["inference_time_sec"]
+        out["teacher_latency_by_seq_len"] = ref["latency_by_seq_len"]
         out["speedup_vs_teacher"] = ref["latency_ms"] / max(1e-9, out["inference_latency_ms"])
 
         ref_params = ref["params"]
@@ -187,6 +199,16 @@ def _evaluate_reference_performance(
         warmup_runs=warmup_runs,
         timed_runs=timed_runs,
     )
+    latency_by_seq_len = _benchmark_latency_by_seq_len(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        seq_lens=[32, 64, 128],
+        max_new_tokens=max_new_tokens,
+        device=device,
+        warmup_runs=warmup_runs,
+        timed_runs=timed_runs,
+    )
     params, _ = _count_model_params(model)
     disk_size_mb = get_model_disk_size_bytes(model_path) / (1024 * 1024)
 
@@ -195,6 +217,7 @@ def _evaluate_reference_performance(
         "throughput_tokens_per_sec": perf["throughput_tokens_per_sec"],
         "tokens_processed": perf["tokens_processed"],
         "inference_time_sec": perf["inference_time_sec"],
+        "latency_by_seq_len": latency_by_seq_len,
         "params": float(params),
         "disk_size_mb": float(disk_size_mb),
     }
@@ -226,6 +249,7 @@ def _measure_generation_performance_on_prompts(
     device: torch.device,
     warmup_runs: int = 10,
     timed_runs: int = 100,
+    input_max_length: int | None = None,
 ) -> dict[str, float]:
     if not prompts:
         return {
@@ -244,7 +268,14 @@ def _measure_generation_performance_on_prompts(
     tokens_processed = 0
 
     def _run_prompt(prompt: str) -> tuple[float, int]:
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+        kwargs: dict[str, Any] = {"return_tensors": "pt", "truncation": True}
+        if input_max_length is not None:
+            kwargs["max_length"] = int(input_max_length)
+        try:
+            inputs = tokenizer(prompt, **kwargs).to(device)
+        except TypeError:
+            kwargs.pop("max_length", None)
+            inputs = tokenizer(prompt, **kwargs).to(device)
         _synchronize_device(device)
         start = time.perf_counter()
         outputs = model.generate(
@@ -281,6 +312,50 @@ def _measure_generation_performance_on_prompts(
         "inference_time_sec": float(total_time),
         "samples": float(runs),
     }
+
+
+def _benchmark_latency_by_seq_len(
+    model: Any,
+    tokenizer: Any,
+    prompts: list[str],
+    seq_lens: list[int],
+    max_new_tokens: int,
+    device: torch.device,
+    warmup_runs: int,
+    timed_runs: int,
+) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    for seq_len in seq_lens:
+        perf = _measure_generation_performance_on_prompts(
+            model=model,
+            tokenizer=tokenizer,
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+            device=device,
+            warmup_runs=warmup_runs,
+            timed_runs=timed_runs,
+            input_max_length=int(seq_len),
+        )
+        out[str(int(seq_len))] = {
+            "latency_ms": float(perf["latency_ms"]),
+            "throughput_tokens_per_sec": float(perf["throughput_tokens_per_sec"]),
+            "tokens_processed": float(perf["tokens_processed"]),
+            "inference_time_sec": float(perf["inference_time_sec"]),
+        }
+    return out
+
+
+def _resolve_latency_seq_lens(config: Any) -> list[int]:
+    values = getattr(config, "latency_seq_lens", [32, 64, 128])
+    seq_lens: list[int] = []
+    for value in values:
+        try:
+            seq_lens.append(max(1, int(value)))
+        except Exception:
+            continue
+    if not seq_lens:
+        return [32, 64, 128]
+    return seq_lens
 
 
 def _compute_token_calibration_metrics(

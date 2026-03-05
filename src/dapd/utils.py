@@ -15,6 +15,7 @@ import torch
 import yaml
 
 _MPS_PEAK_ALLOCATED_BYTES = 0
+_MPS_BF16_HINT_EMITTED = False
 
 
 def set_seed(seed: int, deterministic: bool = True) -> None:
@@ -57,6 +58,8 @@ def infer_device(device: str = "auto") -> torch.device:
 
 
 def validate_runtime_precision(device: torch.device, fp16: bool, bf16: bool) -> None:
+    global _MPS_BF16_HINT_EMITTED
+
     if fp16 and device.type != "cuda":
         raise ValueError(
             "runtime.fp16=true is only supported with CUDA in Hugging Face Trainer. "
@@ -68,6 +71,18 @@ def validate_runtime_precision(device: torch.device, fp16: bool, bf16: bool) -> 
             "runtime.bf16=true is only supported with CUDA in this pipeline. "
             "Set runtime.bf16=false for MPS/CPU."
         )
+
+    if device.type == "mps" and not bf16 and not _MPS_BF16_HINT_EMITTED:
+        logging.getLogger("dapd.utils").warning(
+            "MPS runtime uses float32 by default. Note: torch.bfloat16 tensors are available on MPS "
+            "via torch_dtype=torch.bfloat16, but Hugging Face Trainer bf16 flag is not used here."
+        )
+        _MPS_BF16_HINT_EMITTED = True
+
+
+def get_mps_safe_dtype() -> torch.dtype:
+    """Return a stable dtype for Apple Silicon (MPS) training/inference."""
+    return torch.float32
 
 
 def validate_quantization_config(device: torch.device, use_qlora: bool) -> None:

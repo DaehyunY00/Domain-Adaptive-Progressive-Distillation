@@ -2,8 +2,8 @@ data:
   datasets: ["pubmed_qa", "medmcqa"]
   preprocessing_version: "v1"
   seed: 42
-  max_train_samples: 1200
-  max_eval_samples: 128
+  max_train_samples: 100
+  max_eval_samples: 32
   max_length: 192
   num_proc: 1
   cache_dir: "./cache/hf"
@@ -21,8 +21,8 @@ adaptation:
   gradient_accumulation_steps: 32
   warmup_ratio: 0.03
   logging_steps: 10
-  eval_steps: 200
-  save_steps: 200
+  eval_steps: 50
+  save_steps: 50
   evaluation_strategy: "no"
   save_strategy: "epoch"
   lora_r: 8
@@ -45,8 +45,8 @@ distillation:
   gradient_accumulation_steps: 32
   warmup_ratio: 0.03
   logging_steps: 10
-  eval_steps: 200
-  save_steps: 200
+  eval_steps: 50
+  save_steps: 50
   evaluation_strategy: "no"
   save_strategy: "epoch"
   gradient_checkpointing: true
@@ -76,11 +76,11 @@ pruning:
 evaluation:
   enabled: true
   output_file: "./runs/dapd_mps/eval_metrics.json"
-  max_eval_samples: 64
+  max_eval_samples: 20
   batch_size: 1
   max_new_tokens: 16
   generation_temperature: 0.0
-  num_latency_samples: 50
+  num_latency_samples: 10
   latency_seq_lens: [32, 64, 128]
   latency_warmup_runs: 10
   latency_benchmark_runs: 100

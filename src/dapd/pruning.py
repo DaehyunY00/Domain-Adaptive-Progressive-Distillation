@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .analysis.flops import estimate_model_flops_gmac, summarize_flops_reduction
 from .data import CausalLMDataCollator
 from .utils import (
     count_parameters,
@@ -39,6 +40,9 @@ class PruningArtifacts:
     parameter_sparsity: float
     model_size_before_mb: float
     model_size_after_mb: float
+    flops_before_gmac: float | None
+    flops_after_gmac: float | None
+    flops_reduction_ratio: float | None
     estimated_speedup_potential: float
     pruning_report_path: str
 
@@ -92,6 +96,7 @@ def run_structured_pruning(
         model.config.use_cache = False
 
     model_size_before_mb = get_model_disk_size_bytes(model_path) / (1024 * 1024)
+    flops_before_gmac = estimate_model_flops_gmac(model=model, seq_len=128, batch_size=1, device=device)
 
     activations = _collect_activation_importance(
         model=model,
@@ -171,6 +176,11 @@ def run_structured_pruning(
     total_params, nonzero_params = count_parameters(model)
     sparsity = 1.0 - (nonzero_params / max(1, total_params))
     model_size_after_mb = get_model_disk_size_bytes(final_dir) / (1024 * 1024)
+    flops_after_gmac = estimate_model_flops_gmac(model=model, seq_len=128, batch_size=1, device=device)
+    flops_stats = summarize_flops_reduction(
+        flops_before_gmac=flops_before_gmac,
+        flops_after_gmac=flops_after_gmac,
+    )
 
     mode_used = _resolve_pruning_mode_used(
         requested_mode=str(getattr(config, "pruning_mode", "masking")),
@@ -210,6 +220,7 @@ def run_structured_pruning(
         "parameter_sparsity": float(sparsity),
         "model_size_before_mb": float(model_size_before_mb),
         "model_size_after_mb": float(model_size_after_mb),
+        "flops": flops_stats,
         "estimated_speedup_potential": float(estimated_speedup),
     }
     report_path = Path(output_dir) / "pruning_report.json"
@@ -250,6 +261,9 @@ def run_structured_pruning(
         parameter_sparsity=float(sparsity),
         model_size_before_mb=float(model_size_before_mb),
         model_size_after_mb=float(model_size_after_mb),
+        flops_before_gmac=flops_stats["flops_before_gmac"],
+        flops_after_gmac=flops_stats["flops_after_gmac"],
+        flops_reduction_ratio=flops_stats["flops_reduction_ratio"],
         estimated_speedup_potential=float(estimated_speedup),
         pruning_report_path=str(report_path),
     )
@@ -431,7 +445,7 @@ def _prune_attention_heads(
 
         if heads_to_prune:
             deduped = {idx: sorted(set(v)) for idx, v in heads_to_prune.items() if v}
-            if deduped and _try_physical_head_prune(
+            if deduped and physical_prune_attention_heads(
                 model=model,
                 heads_to_prune=deduped,
                 logger=logger,
@@ -538,7 +552,7 @@ def _prune_mlp_neurons(
         return 0, total, False
 
     if physical_mode:
-        if _try_physical_mlp_prune(model=model, plans=plans, config=config, logger=logger):
+        if physical_prune_mlp_neurons(model=model, plans=plans, config=config, logger=logger):
             return pruned, total, True
 
         if logger is not None:
@@ -654,12 +668,13 @@ def _apply_mlp_masking(plans: list[dict[str, Any]]) -> None:
                 up_proj.bias[prune_idx] = 0.0
 
 
-def _try_physical_head_prune(
+def physical_prune_attention_heads(
     model: torch.nn.Module,
-    heads_to_prune: dict[int, list[int]],
+    heads_to_prune: dict[int, list[int]] | None = None,
     logger: Any | None = None,
 ) -> bool:
-    """Try architecture-provided physical attention head pruning APIs."""
+    """Physically remove attention heads using architecture-native prune APIs."""
+    heads_to_prune = heads_to_prune or {}
     if not heads_to_prune:
         return False
 
@@ -680,14 +695,17 @@ def _try_physical_head_prune(
     return False
 
 
-def _try_physical_mlp_prune(
+def physical_prune_mlp_neurons(
     model: torch.nn.Module,
-    plans: list[dict[str, Any]],
-    config: Any,
+    plans: list[dict[str, Any]] | None = None,
+    config: Any | None = None,
     logger: Any | None = None,
 ) -> bool:
-    """Try physical MLP neuron pruning for LLaMA-like gate/up/down blocks only."""
+    """Physically remove MLP neurons for LLaMA-like gate/up/down blocks."""
+    plans = plans or []
     if not plans:
+        return False
+    if config is None:
         return False
 
     if not _is_llama_like_mlp_model(model):

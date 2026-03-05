@@ -21,6 +21,7 @@ dependencies = [
   "transformers>=4.42.0",
   "tqdm>=4.66.0",
   "psutil>=5.9.8",
+  "fvcore>=0.1.5.post20221221",
 ]
 
 [project.optional-dependencies]

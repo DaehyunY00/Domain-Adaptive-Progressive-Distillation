@@ -7,8 +7,12 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from .analysis import (
+    analyze_teacher_calibration,
+    analyze_teacher_information,
     analyze_pruning_patterns,
     analyze_teacher_distributions,
+    generate_baseline_comparison,
+    run_distillation_interventions,
     run_temperature_schedule_analysis,
 )
 from .adaptation import AdaptationArtifacts, run_domain_adaptation
@@ -64,7 +68,15 @@ class DAPDPipeline:
         )
 
         need_teacher_tokenized = bool(
-            cfg.adaptation.enabled or (cfg.analysis.enabled and cfg.analysis.run_teacher_distribution)
+            cfg.adaptation.enabled
+            or (
+                cfg.analysis.enabled
+                and (
+                    cfg.analysis.run_teacher_distribution
+                    or getattr(cfg.analysis, "run_teacher_calibration", False)
+                    or getattr(cfg.analysis, "run_teacher_information", False)
+                )
+            )
         )
         teacher_data = None
         if need_teacher_tokenized:
@@ -153,54 +165,65 @@ class DAPDPipeline:
             logger.info("step5 complete | eval_metrics=%s", cfg.evaluation.output_file)
 
             if cfg.evaluation.run_ood_test:
-                try:
-                    ood_text = build_external_eval_dataset(
-                        dataset_name=cfg.evaluation.ood_test_dataset,
-                        cache_dir=cfg.data.cache_dir,
-                        seed=cfg.data.seed,
-                        max_eval_samples=cfg.evaluation.ood_max_eval_samples,
-                    )
-                    ood_lm = tokenize_for_causal_lm(
-                        dataset=ood_text,
-                        tokenizer=eval_tokenizer,
-                        max_length=cfg.data.max_length,
-                        num_proc=cfg.data.num_proc,
-                        split_name=f"ood_{cfg.evaluation.ood_test_dataset.lower()}",
-                        tokenized_cache_dir=cfg.data.tokenized_cache_dir,
-                        enable_map_cache=cfg.data.enable_map_cache,
-                        dataset_names=[cfg.evaluation.ood_test_dataset],
-                        seed=cfg.data.seed,
-                        preprocessing_version=cfg.data.preprocessing_version,
-                    )
-                    ood_metrics = evaluate_model(
-                        model_path=final_model_path,
-                        text_dataset=ood_text,
-                        lm_dataset=ood_lm,
-                        config=cfg.evaluation,
-                        runtime=cfg.runtime,
-                        reference_model_path=adapt_artifacts.teacher_path,
-                    )
-                    ood_metrics["ood_dataset"] = cfg.evaluation.ood_test_dataset
-                    ood_metrics["train_datasets"] = list(cfg.data.datasets)
-                    if eval_metrics is not None:
-                        ood_metrics["performance_drop"] = {
-                            "accuracy_drop": float(eval_metrics["accuracy"] - ood_metrics["accuracy"]),
-                            "f1_drop": float(eval_metrics["f1"] - ood_metrics["f1"]),
-                            "perplexity_increase": float(
-                                ood_metrics["perplexity"] - eval_metrics["perplexity"]
-                            ),
-                        }
-                    dump_json(ood_metrics, cfg.evaluation.ood_output_file)
-                    logger.info("step5 OOD complete | metrics=%s", cfg.evaluation.ood_output_file)
-                except Exception as exc:
-                    logger.warning("OOD evaluation skipped: %s", exc)
-                    ood_metrics = {
-                        "ood_dataset": cfg.evaluation.ood_test_dataset,
-                        "error": str(exc),
-                    }
+                ood_metrics = self.run_ood_evaluation(
+                    final_model_path=final_model_path,
+                    adapt_artifacts=adapt_artifacts,
+                    eval_tokenizer=eval_tokenizer,
+                    eval_metrics=eval_metrics,
+                    logger=logger,
+                )
 
         analysis_results: dict[str, Any] = {}
         if cfg.analysis.enabled:
+            if getattr(cfg.analysis, "run_teacher_calibration", False):
+                try:
+                    if teacher_data is None:
+                        teacher_tokenizer = AutoTokenizer.from_pretrained(
+                            cfg.adaptation.teacher_model_name_or_path,
+                            use_fast=True,
+                        )
+                        teacher_data = prepare_datasets_from_unified(
+                            unified=unified,
+                            config=cfg.data,
+                            tokenizer=teacher_tokenizer,
+                        )
+                    analysis_results["teacher_calibration"] = analyze_teacher_calibration(
+                        general_teacher_path=cfg.adaptation.teacher_model_name_or_path,
+                        domain_teacher_path=adapt_artifacts.teacher_path,
+                        dataset=teacher_data.validation_lm,
+                        runtime=cfg.runtime,
+                        output_dir=cfg.analysis.output_dir,
+                        max_samples=cfg.analysis.max_samples,
+                        n_bins=cfg.evaluation.calibration_bins,
+                    )
+                except Exception as exc:
+                    logger.warning("teacher calibration analysis skipped: %s", exc)
+                    analysis_results["teacher_calibration"] = {"error": str(exc)}
+
+            if getattr(cfg.analysis, "run_teacher_information", False):
+                try:
+                    if teacher_data is None:
+                        teacher_tokenizer = AutoTokenizer.from_pretrained(
+                            cfg.adaptation.teacher_model_name_or_path,
+                            use_fast=True,
+                        )
+                        teacher_data = prepare_datasets_from_unified(
+                            unified=unified,
+                            config=cfg.data,
+                            tokenizer=teacher_tokenizer,
+                        )
+                    analysis_results["teacher_information"] = analyze_teacher_information(
+                        general_teacher_path=cfg.adaptation.teacher_model_name_or_path,
+                        domain_teacher_path=adapt_artifacts.teacher_path,
+                        dataset=teacher_data.validation_lm,
+                        runtime=cfg.runtime,
+                        output_dir=cfg.analysis.output_dir,
+                        max_samples=cfg.analysis.max_samples,
+                    )
+                except Exception as exc:
+                    logger.warning("teacher information analysis skipped: %s", exc)
+                    analysis_results["teacher_information"] = {"error": str(exc)}
+
             if cfg.analysis.run_teacher_distribution:
                 try:
                     if teacher_data is None:
@@ -243,6 +266,24 @@ class DAPDPipeline:
                     logger.warning("temperature analysis skipped: %s", exc)
                     analysis_results["temperature_analysis"] = {"error": str(exc)}
 
+            if getattr(cfg.analysis, "run_distillation_intervention", False):
+                try:
+                    analysis_results["distillation_intervention"] = run_distillation_interventions(
+                        student_model_path=distill_artifacts.student_path,
+                        domain_teacher_path=adapt_artifacts.teacher_path,
+                        dataset=student_data.validation_lm,
+                        runtime=cfg.runtime,
+                        output_dir=cfg.analysis.output_dir,
+                        max_samples=cfg.analysis.max_samples,
+                        alpha=cfg.distillation.alpha,
+                        temperature=cfg.distillation.temperature,
+                        teacher_small_path=getattr(cfg.analysis, "intervention_teacher_small", None),
+                        teacher_large_path=getattr(cfg.analysis, "intervention_teacher_large", None),
+                    )
+                except Exception as exc:
+                    logger.warning("distillation intervention skipped: %s", exc)
+                    analysis_results["distillation_intervention"] = {"error": str(exc)}
+
             if cfg.analysis.run_pruning_patterns:
                 try:
                     if pruning_artifacts is None:
@@ -254,6 +295,23 @@ class DAPDPipeline:
                 except Exception as exc:
                     logger.warning("pruning pattern analysis skipped: %s", exc)
                     analysis_results["pruning_patterns"] = {"error": str(exc)}
+
+            if getattr(cfg.analysis, "run_baseline_comparison", False):
+                try:
+                    method_metrics: dict[str, dict[str, Any]] = {}
+                    if eval_metrics is not None:
+                        method_metrics["DAPD"] = {
+                            "accuracy": eval_metrics.get("accuracy"),
+                            "f1": eval_metrics.get("f1"),
+                            "notes": "From current pipeline run",
+                        }
+                    analysis_results["baseline_comparison"] = generate_baseline_comparison(
+                        method_metrics=method_metrics,
+                        output_dir=cfg.analysis.output_dir,
+                    )
+                except Exception as exc:
+                    logger.warning("baseline comparison skipped: %s", exc)
+                    analysis_results["baseline_comparison"] = {"error": str(exc)}
 
         summary = {
             "config": cfg.to_dict(),
@@ -275,6 +333,60 @@ class DAPDPipeline:
         dump_json(summary, summary_path)
         logger.info("pipeline summary saved to %s", summary_path)
         return summary
+
+    def run_ood_evaluation(
+        self,
+        final_model_path: str,
+        adapt_artifacts: AdaptationArtifacts,
+        eval_tokenizer: Any,
+        eval_metrics: dict[str, Any] | None,
+        logger: Any,
+    ) -> dict[str, Any]:
+        """Run OOD evaluation and save to configured output path."""
+        cfg = self.config
+        try:
+            ood_text = build_external_eval_dataset(
+                dataset_name=cfg.evaluation.ood_test_dataset,
+                cache_dir=cfg.data.cache_dir,
+                seed=cfg.data.seed,
+                max_eval_samples=cfg.evaluation.ood_max_eval_samples,
+            )
+            ood_lm = tokenize_for_causal_lm(
+                dataset=ood_text,
+                tokenizer=eval_tokenizer,
+                max_length=cfg.data.max_length,
+                num_proc=cfg.data.num_proc,
+                split_name=f"ood_{cfg.evaluation.ood_test_dataset.lower()}",
+                tokenized_cache_dir=cfg.data.tokenized_cache_dir,
+                enable_map_cache=cfg.data.enable_map_cache,
+                dataset_names=[cfg.evaluation.ood_test_dataset],
+                seed=cfg.data.seed,
+                preprocessing_version=cfg.data.preprocessing_version,
+            )
+            ood_metrics = evaluate_model(
+                model_path=final_model_path,
+                text_dataset=ood_text,
+                lm_dataset=ood_lm,
+                config=cfg.evaluation,
+                runtime=cfg.runtime,
+                reference_model_path=adapt_artifacts.teacher_path,
+            )
+            ood_metrics["ood_dataset"] = cfg.evaluation.ood_test_dataset
+            ood_metrics["train_datasets"] = list(cfg.data.datasets)
+            if eval_metrics is not None:
+                ood_metrics["performance_drop"] = {
+                    "accuracy_drop": float(eval_metrics["accuracy"] - ood_metrics["accuracy"]),
+                    "f1_drop": float(eval_metrics["f1"] - ood_metrics["f1"]),
+                    "perplexity_increase": float(ood_metrics["perplexity"] - eval_metrics["perplexity"]),
+                }
+            dump_json(ood_metrics, cfg.evaluation.ood_output_file)
+            root_ood_path = Path(cfg.distillation.output_dir).resolve().parent / "ood_results.json"
+            dump_json(ood_metrics, root_ood_path)
+            logger.info("OOD evaluation complete | metrics=%s", cfg.evaluation.ood_output_file)
+            return ood_metrics
+        except Exception as exc:
+            logger.warning("OOD evaluation skipped: %s", exc)
+            return {"ood_dataset": cfg.evaluation.ood_test_dataset, "error": str(exc)}
 
 
 def _summary_path(config: PipelineConfig) -> str:

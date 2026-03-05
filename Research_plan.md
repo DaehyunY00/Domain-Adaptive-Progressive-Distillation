@@ -2,224 +2,442 @@
 
 ## 1. Introduction
 
-Large Language Models (LLMs) have demonstrated strong performance across diverse tasks. However, their large computational requirements limit practical deployment in resource-constrained environments. To address this issue, model compression techniques such as knowledge distillation and pruning have been widely explored.
+Large Language Models (LLMs) have achieved remarkable performance across a wide range of tasks. However, their computational cost makes deployment difficult in resource-constrained environments. Model compression techniques such as **knowledge distillation** and **structured pruning** have therefore become essential tools for efficient LLM deployment.
 
-Despite their effectiveness, most existing distillation approaches assume that both teacher and student models operate within the same domain. In real-world scenarios, however, many applications require domain adaptation, such as biomedical question answering, legal reasoning, and scientific knowledge tasks. Direct distillation from a general-domain teacher model often leads to performance degradation due to domain shift.
+Despite their effectiveness, most existing distillation approaches assume that the teacher and student models operate within the same domain. In practice, many applications involve domain-specific tasks such as biomedical question answering, legal reasoning, or scientific knowledge extraction. In such cases, distillation from a general-domain teacher can produce suboptimal supervision signals due to domain mismatch.
 
-This research proposes **Domain-Adaptive Progressive Distillation (DAPD)**, a multi-stage framework that integrates domain adaptation and model compression for small language models (≤5B parameters). Instead of directly distilling a general-domain teacher into a compressed student model, the proposed method introduces an intermediate domain-adapted model that progressively transfers domain knowledge before compression.
+This research proposes **Domain-Adaptive Progressive Distillation (DAPD)**, a multi-stage framework that integrates domain adaptation, progressive distillation, and structured pruning to efficiently train domain-specialized small language models.
 
-The proposed framework aims to improve the efficiency-performance trade-off of small LLMs while maintaining strong domain-specific performance.
-
----
-
-## 2. Research Objectives
-
-The objectives of this study are:
-
-1. To develop a progressive distillation framework that integrates domain adaptation and model compression.
-2. To improve domain-specific performance of small LLMs while maintaining computational efficiency.
-3. To analyze the trade-off between model size, compression ratio, and domain adaptation performance.
+Unlike conventional distillation pipelines, DAPD introduces an intermediate **domain-adapted teacher model**, which produces more informative soft-label distributions aligned with the target task domain. These improved teacher distributions enable more efficient knowledge transfer during student training.
 
 ---
 
-## 3. Proposed Method
+# 2. Core Theoretical Insight
 
-### 3.1 Overview
+The key theoretical insight behind DAPD is:
 
-The proposed **Domain-Adaptive Progressive Distillation (DAPD)** framework consists of three stages:
+**Domain-adapted teachers produce lower-entropy and more task-aligned soft-label distributions, which improve distillation efficiency.**
 
-1. **Domain Adaptation Stage**
-2. **Progressive Knowledge Distillation Stage**
-3. **Model Compression Stage**
+In standard knowledge distillation, the student model learns from the teacher probability distribution:
 
-The overall pipeline is illustrated below:
+[
+L_{KD} = KL(P_{teacher} || P_{student})
+]
 
+However, when the teacher model is trained on general-domain data while the task belongs to a specialized domain, the teacher distribution may not align well with the target task distribution.
 
+Let
+
+* (P_{task}): task distribution
+* (P_{teacher}^{general}): general teacher
+* (P_{teacher}^{domain}): domain-adapted teacher
+
+DAPD hypothesizes:
+
+[
+KL(P_{teacher}^{domain} || P_{task}) < KL(P_{teacher}^{general} || P_{task})
+]
+
+This implies that the domain-adapted teacher provides a more informative supervision signal for the student model.
+
+From an information-theoretic perspective, domain adaptation reduces prediction entropy:
+
+[
+H(P_{teacher}^{domain}) < H(P_{teacher}^{general})
+]
+
+Lower entropy indicates higher prediction confidence and clearer decision boundaries, resulting in stronger gradients during student optimization.
+
+DAPD therefore improves distillation efficiency by aligning the teacher distribution with the target task distribution before distillation.
+
+---
+
+# 3. Proposed Method
+
+## 3.1 Overview
+
+DAPD consists of three main stages:
+
+1. **Domain Adaptation**
+2. **Progressive Knowledge Distillation**
+3. **Structured Model Compression**
+
+Pipeline:
+
+```
 General Teacher Model
-│
-▼
+        │
+        ▼
 Domain Adaptation (LoRA / QLoRA)
-│
-▼
-Domain-Specialized Intermediate Model
-│
-▼
-Knowledge Distillation
-│
-▼
-Compressed Student Model
-│
-▼
+        │
+        ▼
+Domain-Specialized Teacher
+        │
+        ▼
+Progressive Knowledge Distillation
+        │
+        ▼
+Student Model
+        │
+        ▼
 Structured Pruning
-│
-▼
-Efficient Domain-Specialized Small LLM
-
+        │
+        ▼
+Efficient Domain-Specialized LLM
+```
 
 ---
 
-### 3.2 Stage 1: Domain Adaptation
+# 3.2 Stage 1: Domain Adaptation
 
-A general-domain language model is first adapted to a specific domain using parameter-efficient fine-tuning methods such as **LoRA** or **QLoRA**.
+A general teacher model is adapted to the target domain using parameter-efficient fine-tuning.
 
-Let:
-
-- \( M_T \) : teacher model
-- \( D_{domain} \) : domain dataset
-
-The adapted model is obtained by minimizing:
-
-\[
+[
 L_{adapt} = L_{task}(M_T(D_{domain}))
-\]
+]
 
-This stage produces a **domain-specialized intermediate model**.
-
----
-
-### 3.3 Stage 2: Progressive Knowledge Distillation
-
-Instead of distilling directly from the teacher model, the student model learns from the domain-adapted intermediate model.
-
-The distillation loss is defined as:
-
-\[
-L_{distill} = \alpha \cdot KL(p_T || p_S) + (1-\alpha) \cdot L_{task}
-\]
-
-Where:
-
-- \(p_T\) : teacher output distribution
-- \(p_S\) : student output distribution
-
-This stage allows the student model to inherit domain-specific knowledge more effectively.
+The resulting model becomes a **domain teacher**, which provides improved soft labels for distillation.
 
 ---
 
-### 3.4 Stage 3: Model Compression via Structured Pruning
+# 3.3 Stage 2: Progressive Knowledge Distillation
 
-After distillation, structured pruning is applied to reduce model size.
+Instead of directly distilling from the general teacher, the student learns from the domain teacher.
 
-Pruning is based on **activation importance**:
+The distillation loss:
 
-\[
-Importance_i = \beta |w_i| + (1-\beta) A_i
-\]
+[
+L_{distill} =
+\alpha \cdot CE(y, P_{student}) +
+(1-\alpha) \cdot KL(P_{teacher}, P_{student})
+]
 
-Where:
+DAPD introduces **progressive temperature scheduling** during distillation.
 
-- \(w_i\) : weight magnitude
-- \(A_i\) : domain activation score
+Early training:
 
-This step produces the final compressed model.
+```
+high temperature → knowledge exploration
+```
 
----
+Later training:
 
-## 4. Experimental Setup
+```
+low temperature → knowledge consolidation
+```
 
-### 4.1 Models
-
-Small language models (≤5B parameters):
-
-- Phi-2 (2.7B)
-- Qwen 2.5 3B
-- TinyLlama (1.1B)
-
----
-
-### 4.2 Datasets
-
-Public datasets are used to ensure reproducibility.
-
-Biomedical domain:
-
-- PubMedQA
-
-Scientific reasoning:
-
-- SciQ
-
-Medical QA:
-
-- MedMCQA
+This mechanism acts as a **curriculum distillation strategy**.
 
 ---
 
-### 4.3 Baselines
+# 3.4 Stage 3: Structured Model Compression
 
-The proposed method will be compared against:
+After distillation, structured pruning reduces model complexity.
 
-1. Direct knowledge distillation
-2. LoRA fine-tuning without distillation
-3. Distillation without domain adaptation
-4. Standard pruning methods
+Importance score:
 
----
+[
+Importance_i = \beta |w_i| + (1-\beta)A_i
+]
 
-### 4.4 Evaluation Metrics
+Where
 
-Performance metrics:
+* (w_i): weight magnitude
+* (A_i): activation importance
 
-- Accuracy
-- F1 Score
-- Perplexity
+Pruning is applied to:
 
-Efficiency metrics:
+```
+attention heads
+MLP neurons
+```
 
-- Model size
-- Inference latency
-- Memory usage
-
----
-
-## 5. Expected Contributions
-
-This research is expected to contribute:
-
-1. A novel **Domain-Adaptive Progressive Distillation framework**.
-2. A systematic study of **domain adaptation combined with model compression**.
-3. An efficient training pipeline for small language models.
-4. Open-source reproducible implementation.
+to produce the final compressed student model.
 
 ---
 
-## 6. Implementation Plan
+# 4. Experimental Setup
 
-The full training pipeline includes:
+## 4.1 Models
 
-1. Dataset preprocessing
-2. Domain adaptation training
-3. Knowledge distillation
-4. Structured pruning
-5. Evaluation and benchmarking
+Teacher:
 
-All experiments will be conducted on a MacBook Pro M4 (16GB RAM) using parameter-efficient methods.
+```
+Qwen2.5-1.5B
+```
 
----
+Students:
 
-## 7. Timeline
-
-| Phase | Duration |
-|------|---------|
-| Literature Review | ** weeks |
-| Dataset Preparation | * week |
-| Domain Adaptation Implementation | * weeks |
-| Distillation Implementation | * weeks |
-| Pruning & Optimization | * weeks |
-| Experiments & Analysis | * weeks |
-| Paper Writing | * weeks |
-
-Total expected duration: ** * weeks**
+```
+Qwen2.5-0.5B
+TinyLlama
+Phi-2
+```
 
 ---
 
-## 8. Reproducibility
+## 4.2 Datasets
 
-The entire pipeline will be implemented using open-source tools including:
+Biomedical QA benchmarks:
 
-- HuggingFace Transformers
-- PEFT (LoRA / QLoRA)
-- PyTorch
-- Accelerate
+```
+MedQA (USMLE)
+PubMedQA
+MedMCQA
+BioASQ
+```
 
-All code and experiment configurations will be released publicly.
+These datasets provide diverse evaluation environments for medical reasoning tasks.
+
+---
+
+# 5. Evaluation Protocol
+
+## Performance Metrics
+
+```
+Accuracy
+F1 Score
+Perplexity
+```
+
+## Efficiency Metrics
+
+```
+Compression ratio
+Inference latency
+Throughput
+Memory usage
+```
+
+## Calibration Metrics
+
+```
+Expected Calibration Error (ECE)
+Brier Score
+```
+
+## Statistical Significance
+
+All experiments are repeated with **three random seeds**, and results are reported as:
+
+```
+mean ± standard deviation
+```
+
+---
+
+# 6. Analysis Experiments (Reviewer-Focused)
+
+To understand *why* DAPD works, we conduct six analysis experiments.
+
+---
+
+## Experiment 1: Teacher Entropy Analysis
+
+Goal:
+
+Measure how domain adaptation changes teacher prediction entropy.
+
+Metrics:
+
+```
+H(P_teacher_general)
+H(P_teacher_domain)
+```
+
+Expected observation:
+
+```
+Domain teacher → lower entropy
+```
+
+---
+
+## Experiment 2: Soft Label Information Gain
+
+Goal:
+
+Measure the information provided by teacher soft labels.
+
+Metrics:
+
+```
+KL(P_teacher || uniform)
+KL(P_teacher_general || P_teacher_domain)
+```
+
+Visualization:
+
+```
+soft label distribution histograms
+```
+
+---
+
+## Experiment 3: Distillation Efficiency
+
+Goal:
+
+Evaluate whether domain teachers improve student learning efficiency.
+
+Method:
+
+Compare student training curves under two teachers.
+
+```
+general teacher → student
+domain teacher → student
+```
+
+Metrics:
+
+```
+validation accuracy
+training loss convergence
+```
+
+---
+
+## Experiment 4: Temperature Curriculum Analysis
+
+Goal:
+
+Analyze the effect of progressive temperature scheduling.
+
+Compare:
+
+```
+constant temperature
+linear schedule
+cosine schedule
+```
+
+Metrics:
+
+```
+training stability
+student accuracy
+loss variance
+```
+
+---
+
+## Experiment 5: Domain-Specific Head Analysis
+
+Goal:
+
+Identify domain-specific transformer components.
+
+Method:
+
+Analyze attention head importance scores during pruning.
+
+Visualization:
+
+```
+attention head importance heatmap
+layer-wise pruning patterns
+```
+
+---
+
+## Experiment 6: Out-of-Domain Distillation
+
+Goal:
+
+Evaluate domain generalization.
+
+Train on:
+
+```
+PubMedQA
+```
+
+Test on:
+
+```
+BioASQ
+```
+
+Compare:
+
+```
+general teacher distillation
+domain teacher distillation
+```
+
+---
+
+# 7. Baselines
+
+DAPD will be compared with:
+
+```
+Direct Knowledge Distillation
+LoRA Fine-tuning
+SparseGPT
+LLM-Pruner
+```
+
+---
+
+# 8. Ablation Studies
+
+We evaluate the contribution of each component:
+
+```
+DAPD (full pipeline)
+no adaptation
+no distillation
+no pruning
+constant temperature
+```
+
+---
+
+# 9. Expected Contributions
+
+This research contributes:
+
+1. A theoretical insight linking **teacher distribution alignment and distillation efficiency**.
+2. A progressive distillation framework for domain-specific LLM compression.
+3. An empirical study of **teacher distribution shift in domain adaptation**.
+4. Analysis of **domain-specific pruning patterns in LLMs**.
+5. A reproducible open-source pipeline for small domain-specialized language models.
+
+---
+
+# 10. Timeline
+
+| Phase                            | Duration |
+| -------------------------------- | -------- |
+| Literature Review                | 2 weeks  |
+| Dataset Preparation              | 1 week   |
+| Domain Adaptation Implementation | 2 weeks  |
+| Distillation Implementation      | 2 weeks  |
+| Pruning Optimization             | 2 weeks  |
+| Experiments & Analysis           | 3 weeks  |
+| Paper Writing                    | 3 weeks  |
+
+Total duration:
+
+```
+15 weeks
+```
+
+---
+
+# 11. Reproducibility
+
+The entire pipeline will be implemented using open-source frameworks:
+
+```
+PyTorch
+HuggingFace Transformers
+PEFT (LoRA / QLoRA)
+Accelerate
+```
+
+All experiments will be reproducible through configuration files and public datasets.
+

@@ -9,7 +9,7 @@ import yaml
 
 @dataclass
 class DataConfig:
-    datasets: list[str] = field(default_factory=lambda: ["pubmed_qa", "sciq", "medmcqa"])
+    datasets: list[str] = field(default_factory=lambda: ["pubmed_qa", "medmcqa"])
     preprocessing_version: str = "v1"
     train_split: str = "train"
     validation_split: str = "validation"
@@ -35,7 +35,7 @@ class AdaptationConfig:
     num_train_epochs: int = 1
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 16
     warmup_ratio: float = 0.03
     logging_steps: int = 10
     eval_steps: int = 100
@@ -49,6 +49,8 @@ class AdaptationConfig:
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
     use_qlora: bool = False
+    fp16: bool = False
+    bf16: bool = False
     gradient_checkpointing: bool = True
     max_grad_norm: float = 1.0
 
@@ -73,7 +75,7 @@ class DistillationConfig:
     gradient_checkpointing: bool = True
     alpha: float = 0.7
     temperature: float = 2.0
-    temperature_schedule: str = "constant"  # constant | linear | cosine
+    temperature_schedule: str = "linear"  # constant | linear | cosine
     min_temperature: float = 1.0
     allow_kl_fallback_to_ce: bool = False
     max_grad_norm: float = 1.0
@@ -106,6 +108,7 @@ class EvaluationConfig:
     max_new_tokens: int = 32
     generation_temperature: float = 0.0
     num_latency_samples: int = 20
+    latency_seq_lens: list[int] = field(default_factory=lambda: [32, 64, 128])
     latency_benchmark_runs: int = 100
     latency_warmup_runs: int = 10
     calibration_bins: int = 15
@@ -121,9 +124,15 @@ class AnalysisConfig:
     output_dir: str = "runs/dapd/analysis"
     max_samples: int = 128
     run_teacher_distribution: bool = False
+    run_teacher_calibration: bool = False
+    run_teacher_information: bool = False
     run_temperature_analysis: bool = False
+    run_distillation_intervention: bool = False
     run_pruning_patterns: bool = False
+    run_baseline_comparison: bool = False
     temperature_steps: int = 100
+    intervention_teacher_small: str | None = None
+    intervention_teacher_large: str | None = None
 
 
 @dataclass

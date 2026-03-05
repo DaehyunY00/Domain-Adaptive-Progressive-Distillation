@@ -1,0 +1,19 @@
+experiment_groups:
+  group_a_same_family:
+    description: "Same-family distillation (Qwen -> Qwen)"
+    adaptation:
+      teacher_model_name_or_path: "Qwen/Qwen2.5-1.5B-Instruct"
+    distillation:
+      student_model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+      allow_kl_fallback_to_ce: false
+  group_b_cross_family:
+    description: "Cross-family distillation (Qwen -> TinyLlama)"
+    adaptation:
+      teacher_model_name_or_path: "Qwen/Qwen2.5-1.5B-Instruct"
+    distillation:
+      student_model_name_or_path: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      allow_kl_fallback_to_ce: true
+
+notes:
+  - "Group B can trigger tokenizer mismatch; pipeline should fallback to CE when allowed."
+  - "For strict tokenizer compatibility experiments, set allow_kl_fallback_to_ce=false."
