@@ -52,6 +52,7 @@ class DistillationArtifacts:
     used_kl: bool
     distillation_temperature_start: float
     distillation_temperature_end: float
+    dynamics_log_path: str | None = None
 
 
 class ProgressiveDistillationTrainer(Trainer):
@@ -153,6 +154,14 @@ class ProgressiveDistillationTrainer(Trainer):
                 float(temperature),
                 float(self.alpha),
             )
+            if self.model.training:
+                self.log(
+                    {
+                        "temperature": float(temperature),
+                        "ce_loss": float(ce_loss.detach().item()),
+                        "kd_loss": float(kd_loss.detach().item()),
+                    }
+                )
 
         return (loss, outputs) if return_outputs else loss
 
@@ -212,6 +221,7 @@ def run_progressive_distillation(
     runtime: Any,
     datasets: PreparedDatasets,
     teacher_logits_source: TeacherLogitsSource,
+    dynamics_log_path: str | None = None,
 ) -> DistillationArtifacts:
     """Run student training with progressive KD and return output artifacts."""
     output_dir = ensure_dir(config.output_dir)
@@ -257,6 +267,12 @@ def run_progressive_distillation(
         dataloader_pin_memory=device.type == "cuda",
     )
 
+    callbacks = None
+    if dynamics_log_path is not None:
+        from .analysis import create_dynamics_callback
+
+        callbacks = [create_dynamics_callback(dynamics_log_path)]
+
     trainer = ProgressiveDistillationTrainer(
         model=student_model,
         args=training_args,
@@ -264,6 +280,7 @@ def run_progressive_distillation(
         eval_dataset=datasets.validation_lm,
         data_collator=CausalLMDataCollator(student_tokenizer),
         tokenizer=student_tokenizer,
+        callbacks=callbacks,
         teacher_logits_source=teacher_logits_source,
         alpha=config.alpha,
         base_temperature=config.temperature,
@@ -304,6 +321,7 @@ def run_progressive_distillation(
         used_kl=teacher_logits_source.use_kl,
         distillation_temperature_start=float(config.temperature),
         distillation_temperature_end=float(temp_end),
+        dynamics_log_path=dynamics_log_path,
     )
 
 

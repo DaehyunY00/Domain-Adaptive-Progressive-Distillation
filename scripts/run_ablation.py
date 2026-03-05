@@ -21,11 +21,12 @@ def _ensure_local_src_on_path() -> None:
 _ensure_local_src_on_path()
 
 from dapd.config import PipelineConfig
+from dapd.data import bioasq_proxy_fallback_used, reset_bioasq_proxy_fallback_flag
 from dapd.pipeline import DAPDPipeline
 from dapd.utils import dump_json, ensure_dir
 
 
-VARIANTS = ("full", "no_adapt", "no_kd", "no_prune")
+VARIANTS = ("full", "no_adapt", "no_kd", "no_prune", "constant_temp")
 
 
 def main() -> None:
@@ -35,9 +36,10 @@ def main() -> None:
         "--variants",
         type=str,
         default=",".join(VARIANTS),
-        help="Comma-separated variants. Supported: full,no_adapt,no_kd,no_prune",
+        help="Comma-separated variants. Supported: full,no_adapt,no_kd,no_prune,constant_temp",
     )
     args = parser.parse_args()
+    reset_bioasq_proxy_fallback_flag()
 
     requested_variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     unknown = [v for v in requested_variants if v not in VARIANTS]
@@ -61,6 +63,8 @@ def main() -> None:
             "variant": variant,
             "accuracy": _metric(metrics, "accuracy"),
             "f1": _metric(metrics, "f1"),
+            "ece": _metric(metrics, "ece"),
+            "brier_score": _metric(metrics, "brier_score"),
             "perplexity": _metric(metrics, "perplexity"),
             "compression_ratio": _metric(metrics, "compression_ratio"),
             "throughput_tokens_per_sec": _metric(metrics, "throughput_tokens_per_sec"),
@@ -73,6 +77,11 @@ def main() -> None:
 
     table_path = ablation_root / "ablation_summary.json"
     dump_json({"variants": rows}, table_path)
+    if bioasq_proxy_fallback_used():
+        raise RuntimeError(
+            "BioASQ fallback to pubmed_qa proxy was used during ablation runs. "
+            "OOD claims are not valid."
+        )
 
     print("\nAblation Summary")
     _print_table(rows)
@@ -105,6 +114,10 @@ def _apply_variant(cfg: PipelineConfig, variant: str, ablation_root: Path) -> No
     if variant == "full":
         return
 
+    if variant == "constant_temp":
+        cfg.distillation.temperature_schedule = "constant"
+        return
+
     if variant == "no_adapt":
         cfg.adaptation.enabled = False
         return
@@ -125,6 +138,8 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
         "variant",
         "accuracy",
         "f1",
+        "ece",
+        "brier_score",
         "perplexity",
         "compression_ratio",
         "throughput_tokens_per_sec",

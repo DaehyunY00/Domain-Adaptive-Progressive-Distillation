@@ -18,6 +18,7 @@ from .analysis import (
 from .adaptation import AdaptationArtifacts, run_domain_adaptation
 from .config import PipelineConfig
 from .data import (
+    build_ood_dataset,
     build_external_eval_dataset,
     build_unified_dataset,
     prepare_datasets_from_unified,
@@ -32,6 +33,7 @@ from .distillation import (
 from .evaluation import evaluate_model
 from .pruning import PruningArtifacts, run_structured_pruning
 from .utils import dump_json, dump_yaml, ensure_dir, get_logger, set_seed
+from .utils import infer_device
 
 
 class DAPDPipeline:
@@ -60,12 +62,15 @@ class DAPDPipeline:
         logger.info("saved config snapshot to %s", config_used_path)
 
         unified = build_unified_dataset(cfg.data)
+        ood_data = build_ood_dataset(cfg.data)
         logger.info(
             "dataset ready | train=%s validation=%s test=%s",
             len(unified["train"]),
             len(unified["validation"]),
             len(unified["test"]),
         )
+        if ood_data is not None:
+            logger.info("ood dataset ready | test=%s", len(ood_data["test"]))
 
         need_teacher_tokenized = bool(
             cfg.adaptation.enabled
@@ -112,6 +117,36 @@ class DAPDPipeline:
                 adapt_artifacts.teacher_path,
             )
 
+        teacher_distribution_analysis: dict[str, Any] | None = None
+        teacher_distribution_analysis_path: str | None = None
+        if cfg.evaluation.run_teacher_analysis and cfg.adaptation.enabled:
+            try:
+                if teacher_data is None:
+                    teacher_tokenizer = AutoTokenizer.from_pretrained(
+                        cfg.adaptation.teacher_model_name_or_path,
+                        use_fast=True,
+                    )
+                    teacher_data = prepare_datasets_from_unified(
+                        unified=unified,
+                        config=cfg.data,
+                        tokenizer=teacher_tokenizer,
+                    )
+                teacher_distribution_analysis = analyze_teacher_distributions(
+                    general_teacher_path=cfg.adaptation.teacher_model_name_or_path,
+                    domain_teacher_path=adapt_artifacts.teacher_path,
+                    dataset=teacher_data.validation_text,
+                    lm_dataset=teacher_data.validation_lm,
+                    device=infer_device(cfg.runtime.device),
+                    max_samples=cfg.evaluation.teacher_analysis_samples,
+                    batch_size=1,
+                )
+                teacher_distribution_analysis_path = str(artifact_root / "teacher_distribution_analysis.json")
+                dump_json(teacher_distribution_analysis, teacher_distribution_analysis_path)
+                logger.info("teacher distribution analysis saved: %s", teacher_distribution_analysis_path)
+            except Exception as exc:
+                logger.warning("teacher distribution analysis skipped: %s", exc)
+                teacher_distribution_analysis = {"error": str(exc)}
+
         # Step 2: Prepare teacher logits source for progressive distillation.
         teacher_logits_source: TeacherLogitsSource = prepare_teacher_logits_source(
             distillation_config=cfg.distillation,
@@ -125,16 +160,21 @@ class DAPDPipeline:
         student_tokenizer = AutoTokenizer.from_pretrained(cfg.distillation.student_model_name_or_path, use_fast=True)
         student_data = prepare_datasets_from_unified(unified=unified, config=cfg.data, tokenizer=student_tokenizer)
 
+        dynamics_log_path = str(Path(cfg.distillation.output_dir) / "distillation_dynamics.json")
+
         distill_artifacts: DistillationArtifacts = run_progressive_distillation(
             config=cfg.distillation,
             runtime=cfg.runtime,
             datasets=student_data,
             teacher_logits_source=teacher_logits_source,
+            dynamics_log_path=dynamics_log_path,
         )
         logger.info("step3 complete | distilled_student=%s", distill_artifacts.student_path)
 
         final_model_path = distill_artifacts.student_path
         pruning_artifacts: PruningArtifacts | None = None
+        pruning_analysis: dict[str, Any] | None = None
+        pruning_analysis_path: str | None = None
 
         # Step 4: Structured pruning.
         if cfg.pruning.enabled:
@@ -146,6 +186,18 @@ class DAPDPipeline:
             )
             final_model_path = pruning_artifacts.model_path
             logger.info("step4 complete | pruned_student=%s", final_model_path)
+            try:
+                pruning_analysis = analyze_pruning_patterns(
+                    model_path_before=distill_artifacts.student_path,
+                    model_path_after=final_model_path,
+                    device=infer_device(cfg.runtime.device),
+                )
+                pruning_analysis_path = str(Path(cfg.pruning.output_dir) / "pruning_analysis.json")
+                dump_json(pruning_analysis, pruning_analysis_path)
+                logger.info("pruning analysis saved: %s", pruning_analysis_path)
+            except Exception as exc:
+                logger.warning("post-pruning analysis skipped: %s", exc)
+                pruning_analysis = {"error": str(exc)}
 
         eval_metrics = None
         ood_metrics = None
@@ -164,7 +216,31 @@ class DAPDPipeline:
             dump_json(eval_metrics, cfg.evaluation.output_file)
             logger.info("step5 complete | eval_metrics=%s", cfg.evaluation.output_file)
 
-            if cfg.evaluation.run_ood_test:
+            if ood_data is not None:
+                ood_lm = tokenize_for_causal_lm(
+                    dataset=ood_data["test"],
+                    tokenizer=eval_tokenizer,
+                    max_length=cfg.data.max_length,
+                    num_proc=cfg.data.num_proc,
+                    split_name="ood_test",
+                    tokenized_cache_dir=cfg.data.tokenized_cache_dir,
+                    enable_map_cache=cfg.data.enable_map_cache,
+                    dataset_names=list(getattr(cfg.data, "ood_datasets", []) or []),
+                    seed=cfg.data.seed,
+                    preprocessing_version=cfg.data.preprocessing_version,
+                )
+                ood_metrics = evaluate_model(
+                    model_path=final_model_path,
+                    text_dataset=ood_data["test"],
+                    lm_dataset=ood_lm,
+                    config=cfg.evaluation,
+                    runtime=cfg.runtime,
+                    reference_model_path=adapt_artifacts.teacher_path,
+                )
+                ood_output_file = _derive_ood_output_file(cfg.evaluation.output_file)
+                dump_json(ood_metrics, ood_output_file)
+                logger.info("ood evaluation complete | eval_metrics=%s", ood_output_file)
+            elif cfg.evaluation.run_ood_test:
                 ood_metrics = self.run_ood_evaluation(
                     final_model_path=final_model_path,
                     adapt_artifacts=adapt_artifacts,
@@ -322,10 +398,17 @@ class DAPDPipeline:
             },
             "distillation": asdict(distill_artifacts),
             "pruning": asdict(pruning_artifacts) if pruning_artifacts else None,
+            "pruning_analysis": pruning_analysis,
+            "teacher_distribution_analysis": teacher_distribution_analysis,
             "final_model_path": final_model_path,
             "evaluation": eval_metrics,
             "evaluation_ood": ood_metrics,
-            "analysis": analysis_results if cfg.analysis.enabled else None,
+            "analysis": {
+                "dynamics_log_path": dynamics_log_path,
+                "pruning_analysis_path": pruning_analysis_path,
+                "teacher_distribution_analysis_path": teacher_distribution_analysis_path,
+                "extended_analysis": analysis_results if cfg.analysis.enabled else None,
+            },
             "config_used_path": str(config_used_path),
         }
 
@@ -392,3 +475,10 @@ class DAPDPipeline:
 def _summary_path(config: PipelineConfig) -> str:
     parent = Path(config.distillation.output_dir).resolve().parent
     return str(parent / "pipeline_summary.json")
+
+
+def _derive_ood_output_file(output_file: str) -> str:
+    path = Path(output_file)
+    if path.suffix == ".json":
+        return str(path.with_name(f"{path.stem}_ood.json"))
+    return str(path.with_name(f"{path.name}_ood.json"))

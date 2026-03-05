@@ -45,6 +45,9 @@ class PruningArtifacts:
     flops_reduction_ratio: float | None
     estimated_speedup_potential: float
     pruning_report_path: str
+    sparse_model_path: str | None = None
+    sparse_compression_ratio: float = 1.0
+    dense_size_mb: float = 0.0
 
 
 @dataclass
@@ -96,6 +99,7 @@ def run_structured_pruning(
         model.config.use_cache = False
 
     model_size_before_mb = get_model_disk_size_bytes(model_path) / (1024 * 1024)
+    total_params_before, _ = count_parameters(model)
     flops_before_gmac = estimate_model_flops_gmac(model=model, seq_len=128, batch_size=1, device=device)
 
     activations = _collect_activation_importance(
@@ -172,10 +176,19 @@ def run_structured_pruning(
     ensure_dir(final_dir)
     model.save_pretrained(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
+    sparse_dir = Path(output_dir) / "final_sparse"
+    sparse_stats = save_sparse_model(
+        model=model,
+        output_dir=sparse_dir,
+        tokenizer=tokenizer,
+        sparsity_threshold=0.3,
+    )
 
     total_params, nonzero_params = count_parameters(model)
     sparsity = 1.0 - (nonzero_params / max(1, total_params))
     model_size_after_mb = get_model_disk_size_bytes(final_dir) / (1024 * 1024)
+    parameter_compression_ratio = float(total_params_before / max(1, total_params))
+    disk_compression_ratio = float(model_size_before_mb / max(1e-9, model_size_after_mb))
     flops_after_gmac = estimate_model_flops_gmac(model=model, seq_len=128, batch_size=1, device=device)
     flops_stats = summarize_flops_reduction(
         flops_before_gmac=flops_before_gmac,
@@ -220,6 +233,14 @@ def run_structured_pruning(
         "parameter_sparsity": float(sparsity),
         "model_size_before_mb": float(model_size_before_mb),
         "model_size_after_mb": float(model_size_after_mb),
+        "compression": {
+            "parameter_compression_ratio": parameter_compression_ratio,
+            "disk_size_before_mb": float(model_size_before_mb),
+            "disk_size_after_mb": float(model_size_after_mb),
+            "disk_compression_ratio": disk_compression_ratio,
+            "sparse_size_mb": float(sparse_stats["sparse_size_mb"]),
+            "sparse_compression_ratio": float(sparse_stats["sparse_compression_ratio"]),
+        },
         "flops": flops_stats,
         "estimated_speedup_potential": float(estimated_speedup),
     }
@@ -230,7 +251,7 @@ def run_structured_pruning(
         (
             "structured pruning done | mode=%s | heads %s/%s (physical=%s) | "
             "mlp %s/%s (physical=%s) | layers %s/%s | est_speedup=%.2fx | "
-            "size %.1fMB -> %.1fMB"
+            "size %.1fMB -> %.1fMB | sparse_ratio=%.2fx"
         ),
         mode_used,
         pruned_heads,
@@ -244,6 +265,7 @@ def run_structured_pruning(
         estimated_speedup,
         model_size_before_mb,
         model_size_after_mb,
+        float(sparse_stats["sparse_compression_ratio"]),
     )
 
     return PruningArtifacts(
@@ -266,7 +288,76 @@ def run_structured_pruning(
         flops_reduction_ratio=flops_stats["flops_reduction_ratio"],
         estimated_speedup_potential=float(estimated_speedup),
         pruning_report_path=str(report_path),
+        sparse_model_path=str(sparse_dir),
+        sparse_compression_ratio=float(sparse_stats["sparse_compression_ratio"]),
+        dense_size_mb=float(sparse_stats["dense_size_mb"]),
     )
+
+
+def save_sparse_model(
+    model: torch.nn.Module,
+    output_dir: str | Path,
+    tokenizer: Any,
+    sparsity_threshold: float = 0.3,
+) -> dict[str, float]:
+    """Save sparse-aware model weights and return disk-size compression metrics.
+
+    For each tensor in the state dict, tensors named like `*.weight` with zero
+    fraction above `sparsity_threshold` are converted to sparse COO tensors.
+    All tensors are moved to CPU before serialization.
+    """
+    out_dir = ensure_dir(output_dir)
+    threshold = float(max(0.0, min(1.0, sparsity_threshold)))
+
+    dense_state: dict[str, torch.Tensor] = {}
+    sparse_state: dict[str, torch.Tensor] = {}
+
+    for name, tensor in model.state_dict().items():
+        cpu_tensor = tensor.detach().cpu()
+        dense_state[name] = cpu_tensor
+
+        save_tensor = cpu_tensor
+        if "weight" in name and cpu_tensor.numel() > 0:
+            zero_fraction = float((cpu_tensor == 0).sum().item()) / float(cpu_tensor.numel())
+            if zero_fraction > threshold:
+                try:
+                    # MPS-safe path: always move to CPU before sparse conversion.
+                    save_tensor = cpu_tensor.to_sparse()
+                except Exception:
+                    save_tensor = cpu_tensor
+        sparse_state[name] = save_tensor
+
+    dense_ref_path = Path(out_dir) / "_dense_reference.pt"
+    sparse_state_path = Path(out_dir) / "pytorch_model_sparse.pt"
+
+    torch.save(dense_state, dense_ref_path)
+    dense_bytes = float(dense_ref_path.stat().st_size) if dense_ref_path.exists() else 0.0
+
+    torch.save(sparse_state, sparse_state_path)
+    sparse_bytes = float(sparse_state_path.stat().st_size) if sparse_state_path.exists() else 0.0
+
+    if dense_ref_path.exists():
+        dense_ref_path.unlink()
+
+    if hasattr(model, "config") and getattr(model, "config", None) is not None:
+        cfg = getattr(model, "config")
+        if hasattr(cfg, "save_pretrained"):
+            cfg.save_pretrained(str(out_dir))
+    if hasattr(model, "generation_config") and getattr(model, "generation_config", None) is not None:
+        generation_cfg = getattr(model, "generation_config")
+        if hasattr(generation_cfg, "save_pretrained"):
+            generation_cfg.save_pretrained(str(out_dir))
+
+    tokenizer.save_pretrained(str(out_dir))
+
+    dense_size_mb = float(dense_bytes / (1024 * 1024))
+    sparse_size_mb = float(sparse_bytes / (1024 * 1024))
+    sparse_compression_ratio = float(dense_bytes / max(1.0, sparse_bytes))
+    return {
+        "dense_size_mb": dense_size_mb,
+        "sparse_size_mb": sparse_size_mb,
+        "sparse_compression_ratio": sparse_compression_ratio,
+    }
 
 
 def _collect_activation_importance(
@@ -776,6 +867,8 @@ def physical_prune_mlp_neurons(
 
                 new_down.weight.copy_(down_proj.weight[:, keep_idx])
                 if down_proj.bias is not None and new_down.bias is not None:
+                    # Keep full down_proj bias intentionally: MLP neuron pruning changes
+                    # down_proj input dimension only. Output dimension is unchanged.
                     new_down.bias.copy_(down_proj.bias)
 
             setattr(parent_module, "gate_proj", new_gate)

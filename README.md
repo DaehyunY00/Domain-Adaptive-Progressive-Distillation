@@ -1,173 +1,198 @@
-Research Plan
-Title
+# DAPD: Domain-Adaptive Progressive Distillation
 
-Domain-Adaptive Progressive Distillation:
-Analyzing Teacher Distribution Shift for Efficient Small Language Models
+End-to-end research pipeline for small LLM compression on Apple Silicon (MPS), including:
+- domain adaptation (LoRA)
+- progressive distillation (CE + KD with temperature schedule)
+- structured pruning (masking/physical when supported)
+- evaluation (accuracy/F1/perplexity + latency/memory/compression)
+- analysis utilities (teacher distribution, pruning patterns, OOD comparison)
 
-1. Research Motivation
+## Current Code Status
 
-Large Language Models require substantial computational resources. Knowledge distillation and pruning are widely used to compress models.
+Implemented and wired:
+- Data pipeline for `pubmed_qa`, `medmcqa`, `bioasq` (OOD path supported)
+- MPS-safe runtime defaults (`configs/dapd_mps_safe.yaml`, `configs/dapd_mps_fast.yaml`)
+- Distillation dynamics logging (`distillation_dynamics.json`)
+- Pruning analysis export (`pruning_analysis.json`)
+- Baseline runner (`scripts/run_baselines.py`)
+- Ablation runner with `constant_temp` variant (`scripts/run_ablation.py`)
+- Post-training analysis runner (`scripts/run_analysis.py`)
+- Smoke test script (`scripts/smoke_test.py`)
 
-However, most distillation methods assume that the teacher model and the target task share the same domain.
+Validation status:
+- Test suite passes locally via `PYTHONPATH=src pytest -q`
 
-In many real-world scenarios (e.g., biomedical QA), the teacher model is trained on general-domain data, which leads to domain mismatch between teacher knowledge and student tasks.
+## Repository Structure
 
-This research investigates the following hypothesis:
+```text
+src/dapd/
+  adaptation.py
+  distillation.py
+  pruning.py
+  evaluation.py
+  pipeline.py
+  data.py
+  config.py
+  analysis.py
+  analysis/
+  metrics/
 
-Domain-adapted teachers produce more informative soft-label distributions for distillation.
+scripts/
+  run_pipeline.py
+  run_ablation.py
+  run_baselines.py
+  run_analysis.py
+  smoke_test.py
 
-This hypothesis is grounded in the idea that domain adaptation reduces teacher prediction entropy and improves knowledge transfer.
+configs/
+  dapd_mps_safe.yaml
+  dapd_mps_fast.yaml
+  dapd_example.yaml
+```
 
-Recent work on domain-aware distillation also suggests that domain-specific knowledge alignment can significantly improve student models.
+## Environment Setup
 
-2. Key Research Questions
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
 
-RQ1
-How does the soft-label distribution of a domain-adapted teacher differ from a general teacher?
+Optional (CUDA-only QLoRA path):
+```bash
+python -m pip install -e ".[qlora]"
+```
 
-RQ2
-Does progressive temperature scheduling improve distillation stability?
+## Quick Start (Apple Silicon M4, 16GB)
 
-RQ3
-Do domain-adapted teachers lead to better compressed student models?
+### 1) Check environment
+```bash
+make check_env
+```
 
-RQ4
-Which transformer components are pruned when compressing domain-specific LLMs?
+### 2) Smoke test (~30 min)
+```bash
+make smoke_test
+```
 
-3. Proposed Method
-Overview
+### 3) Full pipeline (~overnight)
+```bash
+make run_mps
+```
 
-The proposed pipeline:
+### 4) Ablation
+```bash
+make run_ablation
+```
 
-General Teacher
-      │
-      ▼
-Domain Adaptation
-      │
-      ▼
-Domain Teacher
-      │
-      ▼
-Progressive Distillation
-      │
-      ▼
-Student Model
-      │
-      ▼
-Structured Pruning
-      │
-      ▼
-Compressed Student
-4. Key Novel Contributions
-Contribution 1
+### 5) Baselines
+```bash
+make run_baselines
+```
 
-Teacher Distribution Analysis
+### 6) Analysis
+```bash
+make run_analysis
+```
 
-We analyze the soft-label distributions of teachers before and after domain adaptation.
+## Direct Script Commands
 
-Metrics:
+Run full pipeline:
+```bash
+PYTHONPATH=src python scripts/run_pipeline.py --config configs/dapd_mps_safe.yaml
+```
 
-entropy
-confidence distribution
-KL divergence
-calibration error
+Run ablation:
+```bash
+PYTHONPATH=src python scripts/run_ablation.py --config configs/dapd_mps_safe.yaml
+```
 
-Goal:
+Run baselines:
+```bash
+PYTHONPATH=src python scripts/run_baselines.py --config configs/dapd_mps_safe.yaml
+```
 
-measure information gain from domain adaptation
-Contribution 2
+Run analysis:
+```bash
+PYTHONPATH=src python scripts/run_analysis.py --config configs/dapd_mps_safe.yaml \
+  --domain_teacher runs/dapd_mps/domain_teacher/merged \
+  --distilled_student runs/dapd_mps/distilled_student/final \
+  --pruned_student runs/dapd_mps/pruned_student/final
+```
 
-Progressive Temperature Distillation
+Smoke test options:
+```bash
+PYTHONPATH=src python scripts/smoke_test.py --device auto
+PYTHONPATH=src python scripts/smoke_test.py --skip_training
+```
 
-We interpret temperature scheduling as a curriculum learning mechanism.
+## Output Artifacts
 
-Early training:
+Main run artifacts are saved under the configured run root, for example:
 
-high temperature
-→ knowledge exploration
+```text
+runs/dapd_mps/
+  config_used.yaml
+  pipeline_summary.json
+  eval_metrics.json
+  eval_metrics_ood.json (if OOD enabled)
+  domain_teacher/
+  distilled_student/
+  pruned_student/
+```
 
-Late training:
+Smoke test artifacts:
+```text
+runs/smoke_test/
+  domain_teacher/
+  distilled_student/final/
+  pruned_student/final/
+  eval_metrics.json
+  distillation_dynamics.json
+  pruning_analysis.json
+```
 
-low temperature
-→ knowledge consolidation
+## BioASQ OOD Important Note
 
-We empirically analyze the effect of temperature schedules.
+If `bioasq` cannot be loaded from Hugging Face (`kroshan/BioASQ`), the loader falls back to `pubmed_qa` proxy for continuity.
 
-Contribution 3
+To prevent invalid OOD reporting, experiment scripts now fail explicitly when this fallback is used:
+- `scripts/run_pipeline.py`
+- `scripts/run_ablation.py`
+- `scripts/run_baselines.py`
+- `scripts/run_analysis.py`
 
-Domain-Specific Pruning Analysis
+If this error appears, provide real BioASQ data and rerun.
 
-We analyze which transformer components are pruned during compression.
+## MPS Memory Guidance
 
-Focus:
+Approximate peak unified memory (M4 16GB):
+- Domain Adaptation (LoRA): ~5-6 GB
+- Distillation (teacher + student): ~8-9 GB
+- Pruning + Evaluation: ~3-4 GB
 
-attention heads
-MLP neurons
+If you hit OOM:
+- use `configs/dapd_mps_fast.yaml`
+- reduce `data.max_length`
+- reduce `evaluation.num_latency_samples`
+- keep `runtime.fp16=false`, `runtime.bf16=false` on Trainer path for MPS stability
 
-We visualize pruning patterns and test whether domain-specific heads exist.
+## Reproducibility
 
-5. Experimental Setup
-Models
+- Set `runtime.seed` and `runtime.deterministic=true`
+- Keep `data.enable_map_cache=true`
+- Track `config_used.yaml` and `pipeline_summary.json` per run
 
-Teacher
+## Test & Validation
 
-Qwen2.5-1.5B
+Run full tests:
+```bash
+PYTHONPATH=src pytest -q
+```
 
-Student
-
-Qwen2.5-0.5B
-TinyLlama
-Phi-2
-Datasets
-
-Medical QA benchmarks
-
-MedQA (USMLE)
-PubMedQA
-MedMCQA
-BioASQ
-
-MedQA is a widely used benchmark derived from US medical licensing exam questions and is commonly used to evaluate LLM medical reasoning ability.
-
-6. Evaluation Protocol
-Performance Metrics
-Accuracy
-F1
-Perplexity
-Efficiency Metrics
-Compression ratio
-Latency
-Throughput
-Memory
-Calibration Metrics
-Expected Calibration Error (ECE)
-Brier Score
-Generalization Tests
-train: PubMedQA
-test: BioASQ
-Statistical Testing
-3 random seeds
-mean ± std
-paired t-test
-7. Baselines
-
-We compare with:
-
-Direct KD
-LoRA-only fine-tuning
-SparseGPT pruning
-LLM-Pruner
-8. Ablation Studies
-
-Experiments:
-
-full DAPD
-no adaptation
-no distillation
-no pruning
-constant temperature
-9. Expected Contributions
-1. empirical analysis of domain-aware distillation
-2. progressive distillation strategy
-3. pruning analysis for domain-specific LLMs
-4. efficient small-domain LLM pipeline
+Quick import checks:
+```bash
+PYTHONPATH=src python -c "from dapd.pipeline import DAPDPipeline; print('Pipeline OK')"
+PYTHONPATH=src python -c "from dapd.analysis import analyze_teacher_distributions; print('Analysis OK')"
+```

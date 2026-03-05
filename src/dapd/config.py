@@ -10,6 +10,8 @@ import yaml
 @dataclass
 class DataConfig:
     datasets: list[str] = field(default_factory=lambda: ["pubmed_qa", "medmcqa"])
+    ood_datasets: list[str] = field(default_factory=list)
+    ood_max_samples: int = 500
     preprocessing_version: str = "v1"
     train_split: str = "train"
     validation_split: str = "validation"
@@ -108,10 +110,14 @@ class EvaluationConfig:
     max_new_tokens: int = 32
     generation_temperature: float = 0.0
     num_latency_samples: int = 20
+    num_warmup_runs: int = 3
     latency_seq_lens: list[int] = field(default_factory=lambda: [32, 64, 128])
     latency_benchmark_runs: int = 100
     latency_warmup_runs: int = 10
+    compute_calibration: bool = True
     calibration_bins: int = 15
+    run_teacher_analysis: bool = False
+    teacher_analysis_samples: int = 200
     run_ood_test: bool = False
     ood_test_dataset: str = "bioasq"
     ood_output_file: str = "runs/dapd/eval_metrics_ood.json"

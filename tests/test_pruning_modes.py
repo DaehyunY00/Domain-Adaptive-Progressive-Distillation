@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from dapd.pruning import run_structured_pruning
+from dapd.pruning import run_structured_pruning, save_sparse_model
 
 
 class DummyTokenizer:
@@ -155,6 +155,11 @@ def test_run_structured_pruning_masking_mode_smoke(monkeypatch: Any, tmp_path: P
     assert "estimated_speedup_potential" in report
     assert isinstance(report.get("attention_patterns"), list)
     assert isinstance(report.get("mlp_patterns"), list)
+    assert isinstance(report.get("compression"), dict)
+    assert "sparse_compression_ratio" in report["compression"]
+    assert artifacts.sparse_model_path is not None
+    assert Path(artifacts.sparse_model_path).exists()
+    assert artifacts.sparse_compression_ratio > 0.0
 
 
 def test_run_structured_pruning_physical_head_api_if_available(
@@ -202,3 +207,33 @@ def test_run_structured_pruning_physical_head_api_if_available(
 
     assert artifacts.physical_attention_pruning_succeeded is True
     assert len(model.prune_head_calls) == 1
+
+
+def test_save_sparse_model_serializes_sparse_weights(tmp_path: Path) -> None:
+    class SparseToy(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(128, 128, bias=False)
+
+    model = SparseToy()
+    with torch.no_grad():
+        model.linear.weight.zero_()
+        model.linear.weight[0, 0] = 1.0
+        model.linear.weight[1, 1] = -1.0
+
+    tokenizer = DummyTokenizer()
+    out_dir = tmp_path / "sparse_ckpt"
+    stats = save_sparse_model(
+        model=model,
+        output_dir=out_dir,
+        tokenizer=tokenizer,
+        sparsity_threshold=0.3,
+    )
+
+    sparse_file = out_dir / "pytorch_model_sparse.pt"
+    assert sparse_file.exists()
+    loaded = torch.load(sparse_file, map_location="cpu")
+    assert loaded["linear.weight"].is_sparse
+    assert stats["dense_size_mb"] > 0.0
+    assert stats["sparse_size_mb"] > 0.0
+    assert stats["sparse_compression_ratio"] > 0.0

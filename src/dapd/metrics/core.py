@@ -7,6 +7,7 @@ from collections import Counter
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -23,22 +24,39 @@ def compute_perplexity(
     collator = CausalLMDataCollator(tokenizer)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator)
 
-    total_loss = 0.0
+    total_nll = 0.0
     total_tokens = 0
 
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            mask = (batch["labels"] != -100).float()
-            token_count = int(mask.sum().item())
-            total_loss += float(outputs.loss.item()) * max(1, token_count)
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch.get("attention_mask"),
+            )
+            labels = batch["labels"]
+            if labels.shape[1] <= 1:
+                continue
+
+            shift_logits = outputs.logits[:, :-1, :].contiguous().float()
+            shift_labels = labels[:, 1:].contiguous()
+            token_count = int((shift_labels != -100).sum().item())
+            if token_count == 0:
+                continue
+
+            nll_sum = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_nll += float(nll_sum.item())
             total_tokens += token_count
 
     if total_tokens == 0:
         return float("inf")
 
-    mean_loss = total_loss / total_tokens
+    mean_loss = total_nll / total_tokens
     return float(math.exp(min(mean_loss, 20)))
 
 
@@ -50,13 +68,55 @@ def compute_qa_metrics(
     max_new_tokens: int,
     temperature: float,
     device: torch.device,
-) -> dict[str, float]:
+) -> dict[str, Any]:
+    """Backward-compatible QA metrics API with calibration outputs."""
+    return compute_qa_metrics_with_calibration(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        max_samples=max_samples,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        device=device,
+    )
+
+
+def compute_qa_metrics_with_calibration(
+    model: Any,
+    tokenizer: Any,
+    dataset: Any,
+    max_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Compute QA metrics with calibration diagnostics.
+
+    Returns:
+        {
+          "accuracy": float,
+          "f1": float,
+          "ece": float,
+          "brier_score": float,
+          "per_sample_confidence": list[float],
+          "per_sample_correct": list[bool],
+        }
+    """
     n = min(max_samples, len(dataset))
     if n == 0:
-        return {"accuracy": 0.0, "f1": 0.0}
+        return {
+            "accuracy": 0.0,
+            "f1": 0.0,
+            "ece": 0.0,
+            "brier_score": 0.0,
+            "per_sample_confidence": [],
+            "per_sample_correct": [],
+        }
 
     exact = 0
     f1_sum = 0.0
+    per_sample_confidence: list[float] = []
+    per_sample_correct: list[bool] = []
 
     for idx in tqdm(range(n), desc="Evaluating QA", leave=False):
         sample = dataset[idx]
@@ -66,6 +126,13 @@ def compute_qa_metrics(
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
 
         with torch.no_grad():
+            lm_out = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+            )
+            first_token_probs = torch.softmax(lm_out.logits[:, -1, :].float(), dim=-1)
+            conf = float(first_token_probs.max(dim=-1).values.mean().item())
+
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
@@ -76,20 +143,95 @@ def compute_qa_metrics(
             )
 
         generated_ids = outputs[0][inputs["input_ids"].shape[1] :]
-        generated = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        if hasattr(tokenizer, "decode"):
+            generated = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        else:
+            generated = str(generated_ids.tolist()).strip()
 
         pred_norm = _normalize_text(generated)
         gold_norm = _normalize_text(gold)
 
         if pred_norm == gold_norm:
             exact += 1
+            per_sample_correct.append(True)
+        else:
+            per_sample_correct.append(False)
 
         f1_sum += _token_f1(pred_norm, gold_norm)
+        per_sample_confidence.append(conf)
+
+    acc = exact / n
+    f1 = f1_sum / n
+    binary_correct = [1 if x else 0 for x in per_sample_correct]
+    ece = compute_ece(per_sample_confidence, [float(x) for x in binary_correct], n_bins=15)
+    brier = compute_brier_score(per_sample_confidence, binary_correct)
 
     return {
-        "accuracy": exact / n,
-        "f1": f1_sum / n,
+        "accuracy": acc,
+        "f1": f1,
+        "ece": ece,
+        "brier_score": brier,
+        "per_sample_confidence": per_sample_confidence,
+        "per_sample_correct": per_sample_correct,
     }
+
+
+def compute_ece(
+    confidences: list[float],
+    accuracies: list[float],
+    n_bins: int = 15,
+) -> float:
+    """Compute Expected Calibration Error from confidence/accuracy pairs."""
+    if not confidences or not accuracies:
+        return 0.0
+    if len(confidences) != len(accuracies):
+        raise ValueError(
+            f"confidences and accuracies must have same length, got {len(confidences)} vs {len(accuracies)}"
+        )
+
+    n = len(confidences)
+    bins = max(1, int(n_bins))
+    bin_counts = [0 for _ in range(bins)]
+    bin_conf_sum = [0.0 for _ in range(bins)]
+    bin_acc_sum = [0.0 for _ in range(bins)]
+
+    for conf, acc in zip(confidences, accuracies):
+        c = float(min(1.0, max(0.0, conf)))
+        a = float(min(1.0, max(0.0, acc)))
+        idx = min(bins - 1, int(c * bins))
+        bin_counts[idx] += 1
+        bin_conf_sum[idx] += c
+        bin_acc_sum[idx] += a
+
+    ece = 0.0
+    for idx in range(bins):
+        count = bin_counts[idx]
+        if count == 0:
+            continue
+        mean_conf = bin_conf_sum[idx] / count
+        mean_acc = bin_acc_sum[idx] / count
+        ece += (count / n) * abs(mean_acc - mean_conf)
+    return float(ece)
+
+
+def compute_brier_score(
+    probabilities: list[float],
+    labels: list[int],
+) -> float:
+    """Compute Brier score for binary events."""
+    if not probabilities or not labels:
+        return 0.0
+    if len(probabilities) != len(labels):
+        raise ValueError(
+            f"probabilities and labels must have same length, got {len(probabilities)} vs {len(labels)}"
+        )
+
+    total = 0.0
+    for p, y in zip(probabilities, labels):
+        prob = float(min(1.0, max(0.0, p)))
+        target = float(1 if int(y) > 0 else 0)
+        total += (prob - target) ** 2
+    return float(total / len(probabilities))
 
 
 def measure_generation_performance(

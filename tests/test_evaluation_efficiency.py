@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -133,8 +134,15 @@ def test_evaluate_model_compression_ratio_gt_one_with_bigger_teacher(
     monkeypatch.setattr(evaluation_module, "compute_perplexity", lambda *args, **kwargs: 12.3)
     monkeypatch.setattr(
         evaluation_module,
-        "compute_qa_metrics",
-        lambda *args, **kwargs: {"accuracy": 0.4, "f1": 0.5},
+        "compute_qa_metrics_with_calibration",
+        lambda *args, **kwargs: {
+            "accuracy": 0.4,
+            "f1": 0.5,
+            "ece": 0.1,
+            "brier_score": 0.2,
+            "per_sample_confidence": [0.7, 0.8],
+            "per_sample_correct": [True, False],
+        },
     )
     monkeypatch.setattr(
         evaluation_module,
@@ -177,7 +185,10 @@ def test_evaluate_model_compression_ratio_gt_one_with_bigger_teacher(
     )
 
     assert out["compression_ratio"] > 1.0
+    assert "disk_size_compression_ratio" in out
+    assert "sparse_disk_size_mb" in out
     assert out["efficiency"]["compression_ratio"] > 1.0
+    assert "disk_size_compression_ratio" in out["efficiency"]
     assert out["speedup_vs_teacher"] >= 0.0
 
 
@@ -239,3 +250,16 @@ def test_calibration_metrics_are_finite() -> None:
     assert math.isfinite(out["brier_score"])
     assert out["expected_calibration_error"] >= 0.0
     assert out["brier_score"] >= 0.0
+
+
+def test_infer_sparse_disk_size_mb_from_final_sparse(tmp_path: Path) -> None:
+    final_dir = tmp_path / "pruned_student" / "final"
+    sparse_dir = tmp_path / "pruned_student" / "final_sparse"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    sparse_file = sparse_dir / "pytorch_model_sparse.pt"
+    sparse_file.write_bytes(b"x" * 1024)
+
+    size_mb = evaluation_module._infer_sparse_disk_size_mb(str(final_dir))
+    assert size_mb is not None
+    assert size_mb > 0.0

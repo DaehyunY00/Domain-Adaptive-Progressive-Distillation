@@ -1,5 +1,7 @@
 data:
   datasets: ["pubmed_qa", "medmcqa"]
+  ood_datasets: ["bioasq"]
+  ood_max_samples: 300
   preprocessing_version: "v1"
   seed: 42
   max_train_samples: 1200

@@ -8,7 +8,10 @@ from typing import Any
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from transformers import PreTrainedTokenizerBase
 
+from .utils import get_logger
+
 TOKENIZATION_PREPROCESSING_VERSION = "v1"
+_BIOASQ_PROXY_FALLBACK_USED = False
 
 
 PROMPT_TEMPLATE = """### Domain Task
@@ -44,6 +47,15 @@ class CausalLMDataCollator:
 
         batch["labels"] = batch["input_ids"].new_tensor(padded_labels)
         return batch
+
+
+def bioasq_proxy_fallback_used() -> bool:
+    return bool(_BIOASQ_PROXY_FALLBACK_USED)
+
+
+def reset_bioasq_proxy_fallback_flag() -> None:
+    global _BIOASQ_PROXY_FALLBACK_USED
+    _BIOASQ_PROXY_FALLBACK_USED = False
 
 
 def prepare_datasets(config: Any, tokenizer: PreTrainedTokenizerBase) -> PreparedDatasets:
@@ -147,6 +159,42 @@ def build_unified_dataset(config: Any) -> DatasetDict:
     return DatasetDict(merged)
 
 
+def build_ood_dataset(config: Any) -> DatasetDict | None:
+    """Build OOD evaluation dataset from `config.ood_datasets`.
+
+    Returns:
+        DatasetDict with only "test" split, or None when no OOD dataset is configured.
+    """
+    ood_datasets = list(getattr(config, "ood_datasets", []) or [])
+    if not ood_datasets:
+        return None
+
+    test_parts: list[Dataset] = []
+    for dataset_name in ood_datasets:
+        single = _load_domain_dataset(dataset_name, getattr(config, "cache_dir", None))
+        if "test" in single:
+            split = single["test"]
+        elif "validation" in single:
+            split = single["validation"]
+        elif "train" in single:
+            split = single["train"]
+        else:
+            continue
+        test_parts.append(split)
+
+    if not test_parts:
+        return None
+
+    merged_test = concatenate_datasets(test_parts) if len(test_parts) > 1 else test_parts[0]
+    merged_test = merged_test.shuffle(seed=int(getattr(config, "seed", 42)))
+
+    max_samples = getattr(config, "ood_max_samples", None)
+    if max_samples is not None:
+        merged_test = merged_test.select(range(min(int(max_samples), len(merged_test))))
+
+    return DatasetDict({"test": merged_test})
+
+
 def build_external_eval_dataset(
     dataset_name: str,
     cache_dir: str | None,
@@ -233,6 +281,7 @@ def tokenize_for_causal_lm(
 
 def _load_domain_dataset(dataset_name: str, cache_dir: str | None) -> DatasetDict:
     key = dataset_name.lower().strip()
+    logger = get_logger("dapd.data")
 
     if key == "pubmedqa" or key == "pubmed_qa":
         raw = load_dataset("pubmed_qa", "pqa_labeled", cache_dir=cache_dir)
@@ -244,8 +293,20 @@ def _load_domain_dataset(dataset_name: str, cache_dir: str | None) -> DatasetDic
         raw = load_dataset("medmcqa", cache_dir=cache_dir)
         mapper = _map_medmcqa
     elif key == "bioasq":
-        raw = _load_bioasq(cache_dir=cache_dir)
-        mapper = _map_bioasq
+        # BioASQ factoid-style subset from Hugging Face.
+        try:
+            raw = load_dataset("kroshan/BioASQ", cache_dir=cache_dir)
+            mapper = _map_bioasq
+        except Exception:
+            global _BIOASQ_PROXY_FALLBACK_USED
+            _BIOASQ_PROXY_FALLBACK_USED = True
+            logger.error(
+                "BioASQ dataset unavailable. Falling back to pubmed_qa held-out split as OOD proxy. "
+                "OOD claims are invalid with this proxy. Manually provide BioASQ from bioasq.org "
+                "and re-run experiments."
+            )
+            raw = load_dataset("pubmed_qa", "pqa_labeled", cache_dir=cache_dir)
+            mapper = _map_pubmedqa
     else:
         raise ValueError(
             "Unsupported dataset "
@@ -304,14 +365,14 @@ def _map_medmcqa(ex: dict[str, Any]) -> dict[str, str]:
 
     cop = ex.get("cop", None)
     answer = ""
-    if isinstance(cop, int) and 0 <= cop < len(options):
-        answer = options[cop]
-    elif isinstance(cop, int) and 1 <= cop <= len(options):
+    if isinstance(cop, int) and 1 <= cop <= len(options):
         answer = options[cop - 1]
-    elif isinstance(cop, str) and cop.isdigit() and int(cop) < len(options):
-        answer = options[int(cop)]
+    elif isinstance(cop, int) and 0 <= cop < len(options):
+        answer = options[cop]
     elif isinstance(cop, str) and cop.isdigit() and 1 <= int(cop) <= len(options):
         answer = options[int(cop) - 1]
+    elif isinstance(cop, str) and cop.isdigit() and int(cop) < len(options):
+        answer = options[int(cop)]
     else:
         answer = str(ex.get("exp", "")).strip()
 
@@ -349,34 +410,14 @@ def _load_bioasq(cache_dir: str | None) -> DatasetDict:
 
 
 def _map_bioasq(ex: dict[str, Any]) -> dict[str, str]:
-    question = str(ex.get("question", ex.get("body", ""))).strip()
+    question = str(ex.get("body", ex.get("question", ""))).strip()
+    answer = ex.get("exact_answer", ex.get("ideal_answer", ""))
+    if isinstance(answer, list):
+        answer = answer[0] if answer else ""
+    answer = str(answer).strip()
 
-    snippets = ex.get("snippets", [])
-    context_parts: list[str] = []
-    if isinstance(snippets, list):
-        for row in snippets:
-            if isinstance(row, dict):
-                txt = str(row.get("text", "")).strip()
-            else:
-                txt = str(row).strip()
-            if txt:
-                context_parts.append(txt)
-
-    context_text = "\n".join(context_parts)
-
-    ideal = ex.get("ideal_answer", "")
-    if isinstance(ideal, list):
-        ideal = " ".join(str(x) for x in ideal if x)
-    ideal = str(ideal).strip()
-
-    exact = ex.get("exact_answer", "")
-    if isinstance(exact, list):
-        exact = " ".join(str(x) for x in exact if x)
-    exact = str(exact).strip()
-
-    target = ideal or exact
-    prompt = f"[BioASQ OOD QA]\nQuestion: {question}\n\nContext:\n{context_text}\n\nAnswer:"
-    return {"domain": "bioasq", "prompt": prompt, "target": target}
+    prompt = f"[Biomedical QA]\nQuestion: {question}\n\nAnswer:"
+    return {"domain": "bioasq", "prompt": prompt, "target": answer}
 
 
 def _tokenize_cache_file(
