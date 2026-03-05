@@ -1,211 +1,173 @@
-# DAPD Full Pipeline
+Research Plan
+Title
 
-Domain-Adaptive Progressive Distillation (DAPD) for small LLMs.
+Domain-Adaptive Progressive Distillation:
+Analyzing Teacher Distribution Shift for Efficient Small Language Models
 
-## DAPD Architecture
+1. Research Motivation
 
-```text
+Large Language Models require substantial computational resources. Knowledge distillation and pruning are widely used to compress models.
+
+However, most distillation methods assume that the teacher model and the target task share the same domain.
+
+In many real-world scenarios (e.g., biomedical QA), the teacher model is trained on general-domain data, which leads to domain mismatch between teacher knowledge and student tasks.
+
+This research investigates the following hypothesis:
+
+Domain-adapted teachers produce more informative soft-label distributions for distillation.
+
+This hypothesis is grounded in the idea that domain adaptation reduces teacher prediction entropy and improves knowledge transfer.
+
+Recent work on domain-aware distillation also suggests that domain-specific knowledge alignment can significantly improve student models.
+
+2. Key Research Questions
+
+RQ1
+How does the soft-label distribution of a domain-adapted teacher differ from a general teacher?
+
+RQ2
+Does progressive temperature scheduling improve distillation stability?
+
+RQ3
+Do domain-adapted teachers lead to better compressed student models?
+
+RQ4
+Which transformer components are pruned when compressing domain-specific LLMs?
+
+3. Proposed Method
+Overview
+
+The proposed pipeline:
+
 General Teacher
-   |
-   |  (1) Domain Adaptation (LoRA on MPS / QLoRA on CUDA)
-   v
-Domain Teacher  -------------------------------+
-   |                                           |
-   |  (2) Progressive Distillation             |
-   |      L = alpha*CE + (1-alpha)*T^2*KL(T||S)
-   v                                           |
-Distilled Student                              |
-   |                                           |
-   |  (3) Structured Pruning                   |
-   v                                           |
-Pruned Student                                 |
-   |                                           |
-   +------------ (4) Evaluation ---------------+
-             acc / F1 / ppl / latency / memory
-             + compression_ratio / throughput / speedup_vs_teacher
-```
+      │
+      ▼
+Domain Adaptation
+      │
+      ▼
+Domain Teacher
+      │
+      ▼
+Progressive Distillation
+      │
+      ▼
+Student Model
+      │
+      ▼
+Structured Pruning
+      │
+      ▼
+Compressed Student
+4. Key Novel Contributions
+Contribution 1
 
-## Key Design Choices
+Teacher Distribution Analysis
 
-1. Apple Silicon(MPS): `use_qlora: false` + LoRA 권장
-2. QLoRA(bitsandbytes 4-bit): CUDA-only
-3. KL distillation: teacher/student tokenizer compatibility required
-4. Reproducibility: deterministic seed, dataset/tokenization cache, config snapshot logging
+We analyze the soft-label distributions of teachers before and after domain adaptation.
 
-## Project Structure
+Metrics:
 
-```text
-.
-├── configs/
-│   ├── dapd_example.yaml
-│   └── dapd_mps_safe.yaml
-├── scripts/
-│   ├── run_pipeline.py
-│   └── run_ablation.py
-└── src/dapd/
-    ├── adaptation.py
-    ├── config.py
-    ├── data.py
-    ├── distillation.py
-    ├── evaluation.py
-    ├── metrics/
-    │   ├── __init__.py
-    │   └── core.py
-    ├── pipeline.py
-    ├── pruning.py
-    └── utils.py
-```
+entropy
+confidence distribution
+KL divergence
+calibration error
 
-## Installation
+Goal:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
+measure information gain from domain adaptation
+Contribution 2
 
-CUDA + QLoRA optional deps:
+Progressive Temperature Distillation
 
-```bash
-python -m pip install -e .[qlora]
-```
+We interpret temperature scheduling as a curriculum learning mechanism.
 
-## Run (Mac MPS default)
+Early training:
 
-`configs/dapd_example.yaml`은 MacBook MPS(16GB) 안전 기본값입니다.
+high temperature
+→ knowledge exploration
 
-```bash
-PYTHONPATH=src python scripts/run_pipeline.py --config configs/dapd_example.yaml
-```
+Late training:
 
-## Run Ablation (Paper-Ready)
+low temperature
+→ knowledge consolidation
 
-Run 4 ablations with programmatic YAML overrides:
+We empirically analyze the effect of temperature schedules.
 
-- `full`: adaptation + KL distillation + pruning
-- `no_adapt`: skip adaptation (use base teacher directly)
-- `no_kd`: CE-only student training (`distillation.use_kl=false`)
-- `no_prune`: skip pruning
+Contribution 3
 
-```bash
-PYTHONPATH=src python scripts/run_ablation.py --config configs/dapd_example.yaml
-```
+Domain-Specific Pruning Analysis
 
-Artifacts are written to `runs/dapd/ablation/{variant}/...`.
+We analyze which transformer components are pruned during compression.
 
-Artifacts are saved under `runs/dapd/...`:
+Focus:
 
-- `runs/dapd/config_used.yaml`
-- `runs/dapd/pipeline_summary.json`
-- `runs/dapd/eval_metrics.json`
-- stage outputs: `runs/dapd/domain_teacher`, `runs/dapd/distilled_student`, `runs/dapd/pruned_student`
+attention heads
+MLP neurons
 
-## Evaluation JSON Example
+We visualize pruning patterns and test whether domain-specific heads exist.
 
-`runs/dapd/eval_metrics.json` includes efficiency metrics:
+5. Experimental Setup
+Models
 
-```json
-{
-  "compression_ratio": 2.4,
-  "throughput_tokens_per_sec": 132.8,
-  "speedup_vs_teacher": 1.7,
-  "latency_ms": 84.2,
-  "memory_usage_mb": 6134.5,
-  "efficiency": {
-    "compression_ratio": 2.4,
-    "throughput_tokens_per_sec": 132.8,
-    "speedup_vs_teacher": 1.7
-  }
-}
-```
+Teacher
 
-## Progressive Distillation Details
+Qwen2.5-1.5B
 
-Distillation objective:
+Student
 
-```text
-L = alpha * CE(student, labels)
-  + (1 - alpha) * T^2 * KL( softmax(teacher/T) || softmax(student/T) )
-```
+Qwen2.5-0.5B
+TinyLlama
+Phi-2
+Datasets
 
-Implementation details:
+Medical QA benchmarks
 
-- padding tokens are masked (`labels == -100`)
-- teacher logits are detached (`torch.no_grad()`)
-- tokenizer mismatch:
-  - default: fail-fast (`allow_kl_fallback_to_ce: false`)
-  - optional: CE-only fallback (`allow_kl_fallback_to_ce: true`)
-- temperature scheduling supported: `constant`, `linear`, `cosine`
+MedQA (USMLE)
+PubMedQA
+MedMCQA
+BioASQ
 
-## Structured Pruning Details
+MedQA is a widely used benchmark derived from US medical licensing exam questions and is commonly used to evaluate LLM medical reasoning ability.
 
-Current pruning method: `structured`
+6. Evaluation Protocol
+Performance Metrics
+Accuracy
+F1
+Perplexity
+Efficiency Metrics
+Compression ratio
+Latency
+Throughput
+Memory
+Calibration Metrics
+Expected Calibration Error (ECE)
+Brier Score
+Generalization Tests
+train: PubMedQA
+test: BioASQ
+Statistical Testing
+3 random seeds
+mean ± std
+paired t-test
+7. Baselines
 
-Supports:
+We compare with:
 
-- attention head pruning
-- MLP neuron pruning
-- optional layer pruning
+Direct KD
+LoRA-only fine-tuning
+SparseGPT pruning
+LLM-Pruner
+8. Ablation Studies
 
-Importance score:
+Experiments:
 
-```text
-importance = beta * weight_magnitude + (1 - beta) * activation_score
-```
-
-Pruning report is exported to:
-
-- `runs/dapd/.../pruning_report.json`
-
-## Troubleshooting
-
-1. `QLoRA(bitsandbytes 4-bit) is CUDA-only...`
-- 원인: MPS/CPU에서 `use_qlora: true`
-- 해결: `adaptation.use_qlora: false`
-
-2. `Teacher and student tokenizers are not compatible for KL distillation...`
-- 해결:
-  - teacher/student를 같은 tokenizer family로 사용
-  - 또는 `distillation.allow_kl_fallback_to_ce: true`
-
-3. `runtime.fp16=true ... Set runtime.fp16=false for MPS/CPU`
-- 해결: MPS에서는 `runtime.fp16=false`, `runtime.bf16=false`
-
-4. MPS OOM
-- `data.max_length` 감소 (예: 256 -> 192)
-- `gradient_accumulation_steps` 증가
-- `max_train_samples`/`max_eval_samples` 감소
-- teacher/student 더 작은 모델 사용
-
-## Reproducibility Instructions
-
-1. Fix random seed
-- `runtime.seed: 42`
-- `runtime.deterministic: true`
-
-2. Fix dataset/tokenization cache
-- `data.cache_dir`
-- `data.tokenized_cache_dir`
-- `data.enable_map_cache: true`
-
-3. Keep config snapshot
-- `runs/dapd/config_used.yaml`
-
-4. Keep environment fixed
-- same machine, same Python/PyTorch/Transformers versions
-
-## Benchmark Table Template
-
-| Method | Teacher | Student | Pruning | Acc | F1 | PPL | Latency (ms) | Throughput (tok/s) | Memory (MB) | Compression Ratio | Speedup vs Teacher |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Adapt only | - | Student | No |  |  |  |  |  |  |  |  |
-| Distill only | General | Student | No |  |  |  |  |  |  |  |  |
-| Distill + Prune | General | Student | Yes |  |  |  |  |  |  |  |  |
-| Adapt -> Distill | Domain | Student | No |  |  |  |  |  |  |  |  |
-| Full DAPD | Domain | Student | Yes |  |  |  |  |  |  |  |  |
-
-## Notes
-
-- Public datasets require internet access for first download.
-- Default settings prioritize stability/reproducibility on MPS; tune hyperparameters for final paper-quality results.
+full DAPD
+no adaptation
+no distillation
+no pruning
+constant temperature
+9. Expected Contributions
+1. empirical analysis of domain-aware distillation
+2. progressive distillation strategy
+3. pruning analysis for domain-specific LLMs
+4. efficient small-domain LLM pipeline

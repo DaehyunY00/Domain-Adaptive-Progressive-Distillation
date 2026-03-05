@@ -77,6 +77,22 @@ evaluation:
   max_new_tokens: 16
   generation_temperature: 0.0
   num_latency_samples: 5
+  latency_warmup_runs: 10
+  latency_benchmark_runs: 100
+  calibration_bins: 15
+  run_ood_test: false
+  ood_test_dataset: "bioasq"
+  ood_output_file: "./runs/dapd/eval_metrics_ood.json"
+  ood_max_eval_samples: 64
+
+analysis:
+  enabled: false
+  output_dir: "./runs/dapd/analysis"
+  max_samples: 64
+  run_teacher_distribution: false
+  run_temperature_analysis: false
+  run_pruning_patterns: false
+  temperature_steps: 100
 
 runtime:
   seed: 42

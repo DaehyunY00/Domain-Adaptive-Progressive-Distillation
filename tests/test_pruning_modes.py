@@ -153,6 +153,8 @@ def test_run_structured_pruning_masking_mode_smoke(monkeypatch: Any, tmp_path: P
     report = json.loads(Path(artifacts.pruning_report_path).read_text(encoding="utf-8"))
     assert report["pruning_mode_used"] == "masking"
     assert "estimated_speedup_potential" in report
+    assert isinstance(report.get("attention_patterns"), list)
+    assert isinstance(report.get("mlp_patterns"), list)
 
 
 def test_run_structured_pruning_physical_head_api_if_available(

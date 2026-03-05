@@ -106,6 +106,24 @@ class EvaluationConfig:
     max_new_tokens: int = 32
     generation_temperature: float = 0.0
     num_latency_samples: int = 20
+    latency_benchmark_runs: int = 100
+    latency_warmup_runs: int = 10
+    calibration_bins: int = 15
+    run_ood_test: bool = False
+    ood_test_dataset: str = "bioasq"
+    ood_output_file: str = "runs/dapd/eval_metrics_ood.json"
+    ood_max_eval_samples: int = 200
+
+
+@dataclass
+class AnalysisConfig:
+    enabled: bool = False
+    output_dir: str = "runs/dapd/analysis"
+    max_samples: int = 128
+    run_teacher_distribution: bool = False
+    run_temperature_analysis: bool = False
+    run_pruning_patterns: bool = False
+    temperature_steps: int = 100
 
 
 @dataclass
@@ -126,6 +144,7 @@ class PipelineConfig:
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
     pruning: PruningConfig = field(default_factory=PruningConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @classmethod
@@ -141,6 +160,7 @@ class PipelineConfig:
         distillation = DistillationConfig(**raw.get("distillation", {}))
         pruning = PruningConfig(**raw.get("pruning", {}))
         evaluation = EvaluationConfig(**raw.get("evaluation", {}))
+        analysis = AnalysisConfig(**raw.get("analysis", {}))
         runtime = RuntimeConfig(**raw.get("runtime", {}))
 
         if data.cache_dir:
@@ -151,6 +171,8 @@ class PipelineConfig:
         distillation.output_dir = _resolve_path(base_dir, distillation.output_dir)
         pruning.output_dir = _resolve_path(base_dir, pruning.output_dir)
         evaluation.output_file = _resolve_path(base_dir, evaluation.output_file)
+        evaluation.ood_output_file = _resolve_path(base_dir, evaluation.ood_output_file)
+        analysis.output_dir = _resolve_path(base_dir, analysis.output_dir)
 
         return cls(
             data=data,
@@ -158,6 +180,7 @@ class PipelineConfig:
             distillation=distillation,
             pruning=pruning,
             evaluation=evaluation,
+            analysis=analysis,
             runtime=runtime,
         )
 
@@ -168,6 +191,7 @@ class PipelineConfig:
             "distillation": vars(self.distillation),
             "pruning": vars(self.pruning),
             "evaluation": vars(self.evaluation),
+            "analysis": vars(self.analysis),
             "runtime": vars(self.runtime),
         }
 

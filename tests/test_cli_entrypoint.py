@@ -18,3 +18,18 @@ def test_run_pipeline_help_smoke() -> None:
 
     assert proc.returncode == 0
     assert "Run DAPD full training pipeline" in proc.stdout
+
+
+def test_run_multi_seed_help_smoke() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_multi_seed.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert "Run DAPD pipeline with multiple seeds" in proc.stdout

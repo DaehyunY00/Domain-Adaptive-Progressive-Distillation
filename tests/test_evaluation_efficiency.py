@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from dapd import evaluation as evaluation_module
@@ -39,11 +40,60 @@ class DummyTokenizer:
         ids = torch.arange(1, base + 1, dtype=torch.long).unsqueeze(0)
         return DummyBatch({"input_ids": ids, "attention_mask": torch.ones_like(ids)})
 
+    def pad(
+        self,
+        features: list[dict[str, list[int]]],
+        return_tensors: str = "pt",
+    ) -> dict[str, torch.Tensor]:
+        assert return_tensors == "pt"
+        max_len = max(len(f["input_ids"]) for f in features)
+
+        def _pad(key: str, value: int) -> torch.Tensor:
+            rows = []
+            for feat in features:
+                row = list(feat[key])
+                if len(row) < max_len:
+                    row = row + [value] * (max_len - len(row))
+                rows.append(row)
+            return torch.tensor(rows, dtype=torch.long)
+
+        out = {
+            "input_ids": _pad("input_ids", 0),
+            "attention_mask": _pad("attention_mask", 0),
+        }
+        if "labels" in features[0]:
+            out["labels"] = _pad("labels", -100)
+        return out
+
 
 class DummyEvalModel(nn.Module):
     def __init__(self, param_count: int) -> None:
         super().__init__()
         self.param = nn.Parameter(torch.ones(param_count, dtype=torch.float32))
+        self.vocab_size = 8
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+    ) -> Any:
+        del attention_mask
+        batch, seq_len = input_ids.shape
+        logits = self.param[0].to(input_ids.device) + torch.arange(
+            self.vocab_size,
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        logits = logits.view(1, 1, self.vocab_size).expand(batch, seq_len, self.vocab_size).contiguous()
+
+        loss = None
+        if labels is not None and seq_len > 1:
+            shift_logits = logits[:, :-1, :].reshape(-1, self.vocab_size)
+            shift_labels = labels[:, 1:].reshape(-1)
+            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+
+        return SimpleNamespace(logits=logits, loss=loss)
 
     def generate(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         max_new_tokens = int(kwargs.get("max_new_tokens", 4))
@@ -146,3 +196,46 @@ def test_throughput_is_finite_and_non_negative() -> None:
     assert math.isfinite(perf["throughput_tokens_per_sec"])
     assert perf["throughput_tokens_per_sec"] >= 0.0
     assert perf["tokens_processed"] >= 0.0
+
+
+def test_latency_benchmark_respects_timed_runs() -> None:
+    model = DummyEvalModel(param_count=8)
+    tokenizer = DummyTokenizer()
+    max_new_tokens = 3
+    timed_runs = 5
+
+    perf = evaluation_module._measure_generation_performance_on_prompts(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=["a b c"],
+        max_new_tokens=max_new_tokens,
+        device=torch.device("cpu"),
+        warmup_runs=2,
+        timed_runs=timed_runs,
+    )
+
+    assert perf["samples"] == pytest.approx(float(timed_runs))
+    assert perf["tokens_processed"] == pytest.approx(float(timed_runs * max_new_tokens))
+
+
+def test_calibration_metrics_are_finite() -> None:
+    model = DummyEvalModel(param_count=8)
+    tokenizer = DummyTokenizer()
+    dataset = [
+        {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [-100, 2, 3]},
+        {"input_ids": [2, 3], "attention_mask": [1, 1], "labels": [-100, 3]},
+    ]
+
+    out = evaluation_module._compute_token_calibration_metrics(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        batch_size=1,
+        bins=10,
+        device=torch.device("cpu"),
+    )
+
+    assert math.isfinite(out["expected_calibration_error"])
+    assert math.isfinite(out["brier_score"])
+    assert out["expected_calibration_error"] >= 0.0
+    assert out["brier_score"] >= 0.0

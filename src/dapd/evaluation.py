@@ -5,9 +5,10 @@ import time
 from typing import Any
 
 import torch
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .data import PROMPT_TEMPLATE
+from .data import CausalLMDataCollator, PROMPT_TEMPLATE
 from .metrics import compute_compression_ratio, compute_perplexity, compute_qa_metrics
 from .utils import collect_memory_stats, get_logger, get_model_disk_size_bytes, infer_device
 
@@ -60,6 +61,16 @@ def evaluate_model(
         prompts=eval_prompts,
         max_new_tokens=config.max_new_tokens,
         device=device,
+        warmup_runs=int(getattr(config, "latency_warmup_runs", 10)),
+        timed_runs=int(getattr(config, "latency_benchmark_runs", 100)),
+    )
+    calibration = _compute_token_calibration_metrics(
+        model=student_model,
+        tokenizer=student_tokenizer,
+        dataset=lm_dataset,
+        batch_size=config.batch_size,
+        bins=int(getattr(config, "calibration_bins", 15)),
+        device=device,
     )
 
     total_params, nonzero_params = _count_model_params(student_model)
@@ -93,6 +104,8 @@ def evaluate_model(
         "tokens_processed": perf["tokens_processed"],
         "inference_time_sec": perf["inference_time_sec"],
         "samples_measured": int(perf["samples"]),
+        "expected_calibration_error": calibration["expected_calibration_error"],
+        "brier_score": calibration["brier_score"],
         "memory_usage": memory_usage,
         "memory_usage_mb": mem.rss_mb,
         "device_allocated_mb": mem.device_allocated_mb,
@@ -107,6 +120,8 @@ def evaluate_model(
             prompts=eval_prompts,
             max_new_tokens=config.max_new_tokens,
             device=device,
+            warmup_runs=int(getattr(config, "latency_warmup_runs", 10)),
+            timed_runs=int(getattr(config, "latency_benchmark_runs", 100)),
         )
 
         out["teacher_latency_ms"] = ref["latency_ms"]
@@ -152,6 +167,8 @@ def _evaluate_reference_performance(
     prompts: list[str],
     max_new_tokens: int,
     device: torch.device,
+    warmup_runs: int,
+    timed_runs: int,
 ) -> dict[str, float]:
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
@@ -167,6 +184,8 @@ def _evaluate_reference_performance(
         prompts=prompts,
         max_new_tokens=max_new_tokens,
         device=device,
+        warmup_runs=warmup_runs,
+        timed_runs=timed_runs,
     )
     params, _ = _count_model_params(model)
     disk_size_mb = get_model_disk_size_bytes(model_path) / (1024 * 1024)
@@ -205,6 +224,8 @@ def _measure_generation_performance_on_prompts(
     prompts: list[str],
     max_new_tokens: int,
     device: torch.device,
+    warmup_runs: int = 10,
+    timed_runs: int = 100,
 ) -> dict[str, float]:
     if not prompts:
         return {
@@ -217,31 +238,37 @@ def _measure_generation_performance_on_prompts(
 
     model.eval()
 
+    warmups = max(0, int(warmup_runs))
+    runs = max(1, int(timed_runs))
     total_time = 0.0
     tokens_processed = 0
 
+    def _run_prompt(prompt: str) -> tuple[float, int]:
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+        _synchronize_device(device)
+        start = time.perf_counter()
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        _synchronize_device(device)
+        elapsed = max(0.0, time.perf_counter() - start)
+        generated_tokens = int(max(0, outputs[0].shape[-1] - inputs["input_ids"].shape[1]))
+        return elapsed, generated_tokens
+
     with torch.no_grad():
-        for prompt in prompts:
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-
-            _synchronize_device(device)
-            start = time.perf_counter()
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-            _synchronize_device(device)
-            elapsed = max(0.0, time.perf_counter() - start)
-
+        for idx in range(warmups):
+            _run_prompt(prompts[idx % len(prompts)])
+        for idx in range(runs):
+            elapsed, generated_tokens = _run_prompt(prompts[idx % len(prompts)])
             total_time += elapsed
-            generated_tokens = int(max(0, outputs[0].shape[-1] - inputs["input_ids"].shape[1]))
             tokens_processed += generated_tokens
 
     safe_time = max(total_time, 1e-9)
-    latency_ms = float((safe_time / max(1, len(prompts))) * 1000.0)
+    latency_ms = float((safe_time / max(1, runs)) * 1000.0)
     throughput = float(tokens_processed / safe_time)
 
     if not math.isfinite(throughput) or throughput < 0:
@@ -252,8 +279,98 @@ def _measure_generation_performance_on_prompts(
         "throughput_tokens_per_sec": throughput,
         "tokens_processed": float(tokens_processed),
         "inference_time_sec": float(total_time),
-        "samples": float(len(prompts)),
+        "samples": float(runs),
     }
+
+
+def _compute_token_calibration_metrics(
+    model: Any,
+    tokenizer: Any,
+    dataset: Any,
+    batch_size: int,
+    bins: int,
+    device: torch.device,
+) -> dict[str, float]:
+    if dataset is None or len(dataset) == 0:
+        return {"expected_calibration_error": 0.0, "brier_score": 0.0}
+
+    collator = CausalLMDataCollator(tokenizer)
+    loader = DataLoader(dataset, batch_size=max(1, int(batch_size)), shuffle=False, collate_fn=collator)
+
+    confidences: list[torch.Tensor] = []
+    correctness: list[torch.Tensor] = []
+    brier_sum = 0.0
+    brier_count = 0.0
+
+    with torch.no_grad():
+        for batch in loader:
+            labels = batch.get("labels")
+            if labels is None:
+                continue
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            if batch["input_ids"].shape[1] <= 1:
+                continue
+
+            outputs = model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
+            logits = outputs.logits[:, :-1, :].float()
+            target = batch["labels"][:, 1:]
+            valid = target != -100
+            if valid.sum().item() == 0:
+                continue
+
+            probs = torch.softmax(logits, dim=-1)
+            conf, pred = probs.max(dim=-1)
+            corr = (pred == target).float()
+
+            flat_valid = valid.reshape(-1)
+            confidences.append(conf.reshape(-1)[flat_valid].detach().cpu())
+            correctness.append(corr.reshape(-1)[flat_valid].detach().cpu())
+
+            safe_target = target.masked_fill(~valid, 0)
+            p_true = probs.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)
+            sq_norm = probs.pow(2).sum(dim=-1)
+            brier_per_token = (sq_norm - 2.0 * p_true + 1.0)[valid]
+            brier_sum += float(brier_per_token.sum().item())
+            brier_count += float(brier_per_token.numel())
+
+    if not confidences:
+        return {"expected_calibration_error": 0.0, "brier_score": 0.0}
+
+    conf_all = torch.cat(confidences).clamp(min=0.0, max=1.0)
+    corr_all = torch.cat(correctness).clamp(min=0.0, max=1.0)
+    ece = _expected_calibration_error(confidences=conf_all, correctness=corr_all, bins=max(1, int(bins)))
+    brier = float(brier_sum / max(1.0, brier_count))
+    if not math.isfinite(brier) or brier < 0:
+        brier = 0.0
+    return {"expected_calibration_error": float(ece), "brier_score": brier}
+
+
+def _expected_calibration_error(
+    confidences: torch.Tensor,
+    correctness: torch.Tensor,
+    bins: int,
+) -> float:
+    if confidences.numel() == 0:
+        return 0.0
+
+    boundaries = torch.linspace(0.0, 1.0, steps=bins + 1)
+    total = float(confidences.numel())
+    ece = 0.0
+    for i in range(bins):
+        low = boundaries[i]
+        high = boundaries[i + 1]
+        if i == bins - 1:
+            in_bin = (confidences >= low) & (confidences <= high)
+        else:
+            in_bin = (confidences >= low) & (confidences < high)
+        count = int(in_bin.sum().item())
+        if count == 0:
+            continue
+        acc = float(correctness[in_bin].mean().item())
+        conf = float(confidences[in_bin].mean().item())
+        ece += abs(acc - conf) * (count / total)
+    return float(ece)
 
 
 def _synchronize_device(device: torch.device) -> None:

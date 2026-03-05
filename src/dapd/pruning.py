@@ -112,6 +112,8 @@ def run_structured_pruning(
     total_layers = 0
     physical_head_success = False
     physical_mlp_success = False
+    attention_patterns: list[dict[str, Any]] = []
+    mlp_patterns: list[dict[str, Any]] = []
 
     if config.enable_attention_head_pruning:
         p, t, physical_head_success = _prune_attention_heads(
@@ -120,6 +122,7 @@ def run_structured_pruning(
             activations=activations,
             config=config,
             logger=logger,
+            details=attention_patterns,
         )
         pruned_heads += p
         total_heads += t
@@ -137,6 +140,7 @@ def run_structured_pruning(
             activations=activations,
             config=config,
             logger=logger,
+            details=mlp_patterns,
         )
         pruned_neurons += p
         total_neurons += t
@@ -195,6 +199,8 @@ def run_structured_pruning(
             "attention_heads_succeeded": physical_head_success,
             "mlp_neurons_succeeded": physical_mlp_success,
         },
+        "attention_patterns": attention_patterns,
+        "mlp_patterns": mlp_patterns,
         "pruned_attention_heads": pruned_heads,
         "total_attention_heads": total_heads,
         "pruned_mlp_neurons": pruned_neurons,
@@ -314,6 +320,7 @@ def _prune_attention_heads(
     activations: ActivationStats,
     config: Any,
     logger: Any | None = None,
+    details: list[dict[str, Any]] | None = None,
 ) -> tuple[int, int, bool]:
     """Prune low-importance attention heads with physical fallback behavior.
 
@@ -398,6 +405,16 @@ def _prune_attention_heads(
                 "layer_idx": _extract_layer_index(q_name),
             }
         )
+        if details is not None:
+            details.append(
+                {
+                    "module": q_name,
+                    "layer_index": _extract_layer_index(q_name),
+                    "num_heads": int(num_heads),
+                    "pruned_heads": [int(x) for x in prune_heads],
+                    "head_scores": [float(x) for x in head_scores.detach().cpu().tolist()],
+                }
+            )
         pruned += n_prune
 
     if not plans:
@@ -437,6 +454,7 @@ def _prune_mlp_neurons(
     activations: ActivationStats,
     config: Any,
     logger: Any | None = None,
+    details: list[dict[str, Any]] | None = None,
 ) -> tuple[int, int, bool]:
     """Prune low-importance MLP neurons with optional physical reduction.
 
@@ -500,6 +518,20 @@ def _prune_mlp_neurons(
                 "intermediate": intermediate,
             }
         )
+        if details is not None:
+            pruned_idx_list = [int(x) for x in prune_idx.detach().cpu().tolist()]
+            neuron_score_cpu = neuron_score.detach().cpu()
+            details.append(
+                {
+                    "module": gate_name,
+                    "layer_index": _extract_layer_index(gate_name),
+                    "total_neurons": int(intermediate),
+                    "pruned_neurons": pruned_idx_list,
+                    "pruned_importance": [float(neuron_score_cpu[idx].item()) for idx in pruned_idx_list],
+                    "importance_mean": float(neuron_score_cpu.mean().item()),
+                    "importance_std": float(neuron_score_cpu.std(unbiased=False).item()),
+                }
+            )
         pruned += n_prune
 
     if not plans:
