@@ -58,9 +58,15 @@ def test_attention_head_pruning_uses_activation_importance() -> None:
     )
 
     config = SimpleNamespace(prune_ratio=0.5, beta=0.0, min_heads_per_layer=1)
-    pruned, total = _prune_attention_heads(model=model, modules=modules, activations=activations, config=config)
+    pruned, total, physical = _prune_attention_heads(
+        model=model,
+        modules=modules,
+        activations=activations,
+        config=config,
+    )
 
     assert (pruned, total) == (1, 2)
+    assert physical is False
 
     q_proj = modules[q_name]
     o_proj = modules[o_name]
@@ -86,9 +92,15 @@ def test_mlp_pruning_zeros_low_importance_neurons() -> None:
     )
 
     config = SimpleNamespace(prune_ratio=0.5, beta=0.0, min_mlp_neurons=3)
-    pruned, total = _prune_mlp_neurons(model=model, modules=modules, activations=activations, config=config)
+    pruned, total, physical = _prune_mlp_neurons(
+        model=model,
+        modules=modules,
+        activations=activations,
+        config=config,
+    )
 
     assert (pruned, total) == (3, 6)
+    assert physical is False
 
     gate = modules[gate_name]
     up = modules[up_name]
@@ -115,7 +127,12 @@ def test_layer_pruning_zeros_low_importance_block() -> None:
 
     activations = ActivationStats(output={}, input={})
     config = SimpleNamespace(beta=1.0, layer_prune_ratio=0.34)
-    pruned, total = _prune_layers(model=model, modules=modules, activations=activations, config=config)
+    pruned, total = _prune_layers(
+        model=model,
+        modules=modules,
+        activations=activations,
+        config=config,
+    )
 
     assert (pruned, total) == (1, 3)
 

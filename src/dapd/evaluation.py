@@ -1,23 +1,15 @@
 from __future__ import annotations
 
+import math
+import time
 from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .metrics import (
-    compute_compression_ratio,
-    compute_perplexity,
-    compute_qa_metrics,
-    measure_generation_performance,
-)
-from .utils import (
-    collect_memory_stats,
-    count_parameters,
-    get_logger,
-    get_model_disk_size_bytes,
-    infer_device,
-)
+from .data import PROMPT_TEMPLATE
+from .metrics import compute_compression_ratio, compute_perplexity, compute_qa_metrics
+from .utils import collect_memory_stats, get_logger, get_model_disk_size_bytes, infer_device
 
 
 def evaluate_model(
@@ -30,41 +22,47 @@ def evaluate_model(
 ) -> dict[str, Any]:
     logger = get_logger("dapd.evaluation", getattr(runtime, "log_level", "INFO"))
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    student_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    student_tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    if student_tokenizer.pad_token is None:
+        student_tokenizer.pad_token = student_tokenizer.eos_token
 
     device = infer_device(runtime.device)
-    model.to(device)
-    model.eval()
+    student_model.to(device)
+    student_model.eval()
 
     ppl = compute_perplexity(
-        model=model,
-        tokenizer=tokenizer,
+        model=student_model,
+        tokenizer=student_tokenizer,
         dataset=lm_dataset,
         batch_size=config.batch_size,
         device=device,
     )
     qa_metrics = compute_qa_metrics(
-        model=model,
-        tokenizer=tokenizer,
+        model=student_model,
+        tokenizer=student_tokenizer,
         dataset=text_dataset,
         max_samples=config.max_eval_samples,
         max_new_tokens=config.max_new_tokens,
         temperature=config.generation_temperature,
         device=device,
     )
-    perf = measure_generation_performance(
-        model=model,
-        tokenizer=tokenizer,
+
+    # Build one prompt batch and reuse it for student/teacher latency fairness.
+    eval_prompts = _build_prompt_batch(
         dataset=text_dataset,
         samples=config.num_latency_samples,
+    )
+
+    perf = _measure_generation_performance_on_prompts(
+        model=student_model,
+        tokenizer=student_tokenizer,
+        prompts=eval_prompts,
         max_new_tokens=config.max_new_tokens,
         device=device,
     )
 
-    total_params, nonzero_params = count_parameters(model)
+    total_params, nonzero_params = _count_model_params(student_model)
     disk_size = get_model_disk_size_bytes(model_path)
     mem = collect_memory_stats(device=device, reset_peak=False)
 
@@ -106,11 +104,11 @@ def evaluate_model(
     if reference_model_path:
         ref = _evaluate_reference_performance(
             model_path=reference_model_path,
-            dataset=text_dataset,
+            prompts=eval_prompts,
             max_new_tokens=config.max_new_tokens,
-            samples=config.num_latency_samples,
             device=device,
         )
+
         out["teacher_latency_ms"] = ref["latency_ms"]
         out["teacher_throughput_tokens_per_sec"] = ref["throughput_tokens_per_sec"]
         out["teacher_tokens_processed"] = ref["tokens_processed"]
@@ -120,9 +118,22 @@ def evaluate_model(
         ref_params = ref["params"]
         ref_disk_mb = ref["disk_size_mb"]
         out["compression_ratio"] = compute_compression_ratio(ref_params, out["model_total_params"])
-        out["disk_compression_ratio"] = compute_compression_ratio(ref_disk_mb, out["model_disk_size_mb"])
+        out["disk_compression_ratio"] = compute_compression_ratio(
+            ref_disk_mb,
+            out["model_disk_size_mb"],
+        )
     else:
         out["disk_compression_ratio"] = 1.0
+
+    out["efficiency"] = {
+        "compression_ratio": out["compression_ratio"],
+        "throughput_tokens_per_sec": out["throughput_tokens_per_sec"],
+        "speedup_vs_teacher": out["speedup_vs_teacher"],
+        "latency_ms": out["latency_ms"],
+        "memory_usage_mb": out["memory_usage_mb"],
+        "device_allocated_mb": out["device_allocated_mb"],
+        "peak_allocated_mb": out["peak_allocated_mb"],
+    }
 
     logger.info(
         "evaluation done | acc=%.4f f1=%.4f ppl=%.2f latency=%.2fms throughput=%.2f tok/s",
@@ -138,9 +149,8 @@ def evaluate_model(
 
 def _evaluate_reference_performance(
     model_path: str,
-    dataset: Any,
+    prompts: list[str],
     max_new_tokens: int,
-    samples: int,
     device: torch.device,
 ) -> dict[str, float]:
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
@@ -151,15 +161,14 @@ def _evaluate_reference_performance(
     model.to(device)
     model.eval()
 
-    perf = measure_generation_performance(
+    perf = _measure_generation_performance_on_prompts(
         model=model,
         tokenizer=tokenizer,
-        dataset=dataset,
-        samples=samples,
+        prompts=prompts,
         max_new_tokens=max_new_tokens,
         device=device,
     )
-    params, _ = count_parameters(model)
+    params, _ = _count_model_params(model)
     disk_size_mb = get_model_disk_size_bytes(model_path) / (1024 * 1024)
 
     return {
@@ -170,3 +179,91 @@ def _evaluate_reference_performance(
         "params": float(params),
         "disk_size_mb": float(disk_size_mb),
     }
+
+
+def _build_prompt_batch(dataset: Any, samples: int) -> list[str]:
+    n = min(max(0, int(samples)), len(dataset))
+    prompts: list[str] = []
+    for i in range(n):
+        prompts.append(PROMPT_TEMPLATE.format(prompt=dataset[i]["prompt"]))
+    return prompts
+
+
+def _count_model_params(model: torch.nn.Module) -> tuple[int, int]:
+    total = 0
+    nonzero = 0
+    for param in model.parameters():
+        tensor = param.detach()
+        total += tensor.numel()
+        nonzero += int(torch.count_nonzero(tensor).item())
+    return total, nonzero
+
+
+def _measure_generation_performance_on_prompts(
+    model: Any,
+    tokenizer: Any,
+    prompts: list[str],
+    max_new_tokens: int,
+    device: torch.device,
+) -> dict[str, float]:
+    if not prompts:
+        return {
+            "latency_ms": 0.0,
+            "throughput_tokens_per_sec": 0.0,
+            "tokens_processed": 0.0,
+            "inference_time_sec": 0.0,
+            "samples": 0.0,
+        }
+
+    model.eval()
+
+    total_time = 0.0
+    tokens_processed = 0
+
+    with torch.no_grad():
+        for prompt in prompts:
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+
+            _synchronize_device(device)
+            start = time.perf_counter()
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            _synchronize_device(device)
+            elapsed = max(0.0, time.perf_counter() - start)
+
+            total_time += elapsed
+            generated_tokens = int(max(0, outputs[0].shape[-1] - inputs["input_ids"].shape[1]))
+            tokens_processed += generated_tokens
+
+    safe_time = max(total_time, 1e-9)
+    latency_ms = float((safe_time / max(1, len(prompts))) * 1000.0)
+    throughput = float(tokens_processed / safe_time)
+
+    if not math.isfinite(throughput) or throughput < 0:
+        throughput = 0.0
+
+    return {
+        "latency_ms": latency_ms,
+        "throughput_tokens_per_sec": throughput,
+        "tokens_processed": float(tokens_processed),
+        "inference_time_sec": float(total_time),
+        "samples": float(len(prompts)),
+    }
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        return
+
+    if (
+        device.type == "mps"
+        and torch.backends.mps.is_available()
+        and hasattr(torch.mps, "synchronize")
+    ):
+        torch.mps.synchronize()

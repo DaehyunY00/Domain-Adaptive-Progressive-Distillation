@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 import torch
@@ -26,6 +27,9 @@ _MLP_SUFFIXES = ("gate_proj", "up_proj", "down_proj")
 class PruningArtifacts:
     model_path: str
     method: str
+    pruning_mode: str
+    physical_attention_pruning_succeeded: bool
+    physical_mlp_pruning_succeeded: bool
     pruned_attention_heads: int
     total_attention_heads: int
     pruned_mlp_neurons: int
@@ -35,6 +39,7 @@ class PruningArtifacts:
     parameter_sparsity: float
     model_size_before_mb: float
     model_size_after_mb: float
+    estimated_speedup_potential: float
     pruning_report_path: str
 
 
@@ -57,11 +62,14 @@ def run_structured_pruning(
     model_path: str,
     calibration_dataset: Any,
 ) -> PruningArtifacts:
-    """Run structured pruning (attention heads, MLP neurons, optional layers).
+    """Run structured pruning with masking or optional physical pruning.
 
-    Importance score is computed as:
-        importance = beta * |weight| + (1 - beta) * activation_score
-    where activation score comes from calibration forward passes.
+    Importance score:
+      importance = beta * |weight| + (1 - beta) * activation_score
+
+    pruning_mode:
+      - masking: always zero-out selected structured units
+      - physical: try physical pruning for supported components, fallback to masking
     """
     logger = get_logger("dapd.pruning", getattr(runtime, "log_level", "INFO"))
     _validate_pruning_config(config)
@@ -102,23 +110,53 @@ def run_structured_pruning(
     total_neurons = 0
     pruned_layers = 0
     total_layers = 0
+    physical_head_success = False
+    physical_mlp_success = False
 
     if config.enable_attention_head_pruning:
-        p, t = _prune_attention_heads(model=model, modules=modules, activations=activations, config=config)
+        p, t, physical_head_success = _prune_attention_heads(
+            model=model,
+            modules=modules,
+            activations=activations,
+            config=config,
+            logger=logger,
+        )
         pruned_heads += p
         total_heads += t
+        if physical_head_success:
+            modules = {
+                name: mod
+                for name, mod in model.named_modules()
+                if isinstance(mod, torch.nn.Linear)
+            }
 
     if config.enable_mlp_pruning:
-        p, t = _prune_mlp_neurons(model=model, modules=modules, activations=activations, config=config)
+        p, t, physical_mlp_success = _prune_mlp_neurons(
+            model=model,
+            modules=modules,
+            activations=activations,
+            config=config,
+            logger=logger,
+        )
         pruned_neurons += p
         total_neurons += t
+        if physical_mlp_success:
+            modules = {
+                name: mod
+                for name, mod in model.named_modules()
+                if isinstance(mod, torch.nn.Linear)
+            }
 
     if config.enable_layer_pruning and config.layer_prune_ratio > 0:
         p, t = _prune_layers(model=model, modules=modules, activations=activations, config=config)
         pruned_layers += p
         total_layers += t
 
-    if previous_use_cache is not None and hasattr(model, "config") and hasattr(model.config, "use_cache"):
+    if (
+        previous_use_cache is not None
+        and hasattr(model, "config")
+        and hasattr(model.config, "use_cache")
+    ):
         model.config.use_cache = previous_use_cache
 
     final_dir = Path(output_dir) / "final"
@@ -130,10 +168,33 @@ def run_structured_pruning(
     sparsity = 1.0 - (nonzero_params / max(1, total_params))
     model_size_after_mb = get_model_disk_size_bytes(final_dir) / (1024 * 1024)
 
+    mode_used = _resolve_pruning_mode_used(
+        requested_mode=str(getattr(config, "pruning_mode", "masking")),
+        head_physical_success=physical_head_success,
+        mlp_physical_success=physical_mlp_success,
+    )
+
+    estimated_speedup = _estimate_speedup_potential(
+        pruned_heads=pruned_heads,
+        total_heads=total_heads,
+        pruned_neurons=pruned_neurons,
+        total_neurons=total_neurons,
+        pruned_layers=pruned_layers,
+        total_layers=total_layers,
+        physical_head_success=physical_head_success,
+        physical_mlp_success=physical_mlp_success,
+    )
+
     report = {
         "method": config.method,
+        "pruning_mode_requested": str(getattr(config, "pruning_mode", "masking")),
+        "pruning_mode_used": mode_used,
         "prune_ratio": config.prune_ratio,
         "beta": config.beta,
+        "physical_pruning": {
+            "attention_heads_succeeded": physical_head_success,
+            "mlp_neurons_succeeded": physical_mlp_success,
+        },
         "pruned_attention_heads": pruned_heads,
         "total_attention_heads": total_heads,
         "pruned_mlp_neurons": pruned_neurons,
@@ -143,18 +204,27 @@ def run_structured_pruning(
         "parameter_sparsity": float(sparsity),
         "model_size_before_mb": float(model_size_before_mb),
         "model_size_after_mb": float(model_size_after_mb),
+        "estimated_speedup_potential": float(estimated_speedup),
     }
     report_path = Path(output_dir) / "pruning_report.json"
     dump_json(report, report_path)
 
     logger.info(
-        "structured pruning done | heads %s/%s | mlp %s/%s | layers %s/%s | size %.1fMB -> %.1fMB",
+        (
+            "structured pruning done | mode=%s | heads %s/%s (physical=%s) | "
+            "mlp %s/%s (physical=%s) | layers %s/%s | est_speedup=%.2fx | "
+            "size %.1fMB -> %.1fMB"
+        ),
+        mode_used,
         pruned_heads,
         total_heads,
+        physical_head_success,
         pruned_neurons,
         total_neurons,
+        physical_mlp_success,
         pruned_layers,
         total_layers,
+        estimated_speedup,
         model_size_before_mb,
         model_size_after_mb,
     )
@@ -162,6 +232,9 @@ def run_structured_pruning(
     return PruningArtifacts(
         model_path=str(final_dir),
         method=config.method,
+        pruning_mode=mode_used,
+        physical_attention_pruning_succeeded=physical_head_success,
+        physical_mlp_pruning_succeeded=physical_mlp_success,
         pruned_attention_heads=pruned_heads,
         total_attention_heads=total_heads,
         pruned_mlp_neurons=pruned_neurons,
@@ -171,6 +244,7 @@ def run_structured_pruning(
         parameter_sparsity=float(sparsity),
         model_size_before_mb=float(model_size_before_mb),
         model_size_after_mb=float(model_size_after_mb),
+        estimated_speedup_potential=float(estimated_speedup),
         pruning_report_path=str(report_path),
     )
 
@@ -239,19 +313,27 @@ def _prune_attention_heads(
     modules: dict[str, torch.nn.Linear],
     activations: ActivationStats,
     config: Any,
-) -> tuple[int, int]:
-    """Prune low-importance attention heads by zeroing aligned projection channels."""
+    logger: Any | None = None,
+) -> tuple[int, int, bool]:
+    """Prune low-importance attention heads with physical fallback behavior.
+
+    Returns:
+      (pruned_heads, total_heads, physical_success)
+    """
+    physical_mode = str(getattr(config, "pruning_mode", "masking")).lower().strip() == "physical"
+
+    plans: list[dict[str, Any]] = []
     pruned = 0
     total = 0
 
     hidden_size = getattr(getattr(model, "config", None), "hidden_size", None)
     num_heads = getattr(getattr(model, "config", None), "num_attention_heads", None)
     if hidden_size is None or num_heads is None or num_heads <= 0:
-        return pruned, total
+        return 0, 0, False
 
     head_dim = hidden_size // num_heads
     if head_dim <= 0 or head_dim * num_heads != hidden_size:
-        return pruned, total
+        return 0, 0, False
 
     for q_name, q_proj in modules.items():
         if not q_name.endswith("q_proj"):
@@ -301,21 +383,52 @@ def _prune_attention_heads(
             start = head_idx * head_dim
             channel_mask[start : start + head_dim] = True
 
-        with torch.no_grad():
-            q_proj.weight[channel_mask, :] = 0.0
-            k_proj.weight[channel_mask, :] = 0.0
-            v_proj.weight[channel_mask, :] = 0.0
-            o_proj.weight[:, channel_mask] = 0.0
-            if q_proj.bias is not None:
-                q_proj.bias[channel_mask] = 0.0
-            if k_proj.bias is not None:
-                k_proj.bias[channel_mask] = 0.0
-            if v_proj.bias is not None:
-                v_proj.bias[channel_mask] = 0.0
-
+        plans.append(
+            {
+                "q_name": q_name,
+                "k_name": k_name,
+                "v_name": v_name,
+                "o_name": o_name,
+                "q_proj": q_proj,
+                "k_proj": k_proj,
+                "v_proj": v_proj,
+                "o_proj": o_proj,
+                "prune_heads": prune_heads,
+                "channel_mask": channel_mask,
+                "layer_idx": _extract_layer_index(q_name),
+            }
+        )
         pruned += n_prune
 
-    return pruned, total
+    if not plans:
+        return 0, total, False
+
+    if physical_mode:
+        heads_to_prune: dict[int, list[int]] = {}
+        for plan in plans:
+            layer_idx = plan["layer_idx"]
+            if layer_idx is None:
+                heads_to_prune = {}
+                break
+            heads_to_prune.setdefault(layer_idx, []).extend(plan["prune_heads"])
+
+        if heads_to_prune:
+            deduped = {idx: sorted(set(v)) for idx, v in heads_to_prune.items() if v}
+            if deduped and _try_physical_head_prune(
+                model=model,
+                heads_to_prune=deduped,
+                logger=logger,
+            ):
+                return pruned, total, True
+
+        if logger is not None:
+            logger.warning(
+                "Physical attention head pruning unavailable for this architecture. "
+                "Falling back to masking."
+            )
+
+    _apply_attention_masking(plans)
+    return pruned, total, False
 
 
 def _prune_mlp_neurons(
@@ -323,9 +436,16 @@ def _prune_mlp_neurons(
     modules: dict[str, torch.nn.Linear],
     activations: ActivationStats,
     config: Any,
-) -> tuple[int, int]:
-    """Prune low-importance MLP neurons by zeroing gate/up rows and down columns."""
-    del model
+    logger: Any | None = None,
+) -> tuple[int, int, bool]:
+    """Prune low-importance MLP neurons with optional physical reduction.
+
+    Returns:
+      (pruned_neurons, total_neurons, physical_success)
+    """
+    physical_mode = str(getattr(config, "pruning_mode", "masking")).lower().strip() == "physical"
+
+    plans: list[dict[str, Any]] = []
     pruned = 0
     total = 0
 
@@ -344,7 +464,6 @@ def _prune_mlp_neurons(
         intermediate = gate_proj.out_features
         if intermediate <= int(config.min_mlp_neurons):
             continue
-
         if up_proj.out_features != intermediate or down_proj.in_features != intermediate:
             continue
 
@@ -369,18 +488,34 @@ def _prune_mlp_neurons(
 
         prune_idx = torch.topk(neuron_score, k=n_prune, largest=False).indices
 
-        with torch.no_grad():
-            gate_proj.weight[prune_idx, :] = 0.0
-            up_proj.weight[prune_idx, :] = 0.0
-            down_proj.weight[:, prune_idx] = 0.0
-            if gate_proj.bias is not None:
-                gate_proj.bias[prune_idx] = 0.0
-            if up_proj.bias is not None:
-                up_proj.bias[prune_idx] = 0.0
-
+        plans.append(
+            {
+                "gate_name": gate_name,
+                "up_name": up_name,
+                "down_name": down_name,
+                "gate_proj": gate_proj,
+                "up_proj": up_proj,
+                "down_proj": down_proj,
+                "prune_idx": prune_idx,
+                "intermediate": intermediate,
+            }
+        )
         pruned += n_prune
 
-    return pruned, total
+    if not plans:
+        return 0, total, False
+
+    if physical_mode:
+        if _try_physical_mlp_prune(model=model, plans=plans, config=config, logger=logger):
+            return pruned, total, True
+
+        if logger is not None:
+            logger.warning(
+                "Physical MLP pruning unavailable for this architecture. Falling back to masking."
+            )
+
+    _apply_mlp_masking(plans)
+    return pruned, total, False
 
 
 def _prune_layers(
@@ -406,9 +541,16 @@ def _prune_layers(
             activation_terms.append(float(output_act.abs().mean().item()))
         if input_act is not None:
             activation_terms.append(float(input_act.abs().mean().item()))
-        activation_score = float(sum(activation_terms) / len(activation_terms)) if activation_terms else 0.0
+        activation_score = (
+            float(sum(activation_terms) / len(activation_terms))
+            if activation_terms
+            else 0.0
+        )
 
-        score = float(float(config.beta) * weight_score + (1.0 - float(config.beta)) * activation_score)
+        score = float(
+            float(config.beta) * weight_score
+            + (1.0 - float(config.beta)) * activation_score
+        )
         layer_prefix_scores.setdefault(prefix, []).append(score)
 
     if not layer_prefix_scores:
@@ -440,6 +582,233 @@ def _prune_layers(
         pruned += 1
 
     return pruned, total_layers
+
+
+def _apply_attention_masking(plans: list[dict[str, Any]]) -> None:
+    for plan in plans:
+        q_proj = plan["q_proj"]
+        k_proj = plan["k_proj"]
+        v_proj = plan["v_proj"]
+        o_proj = plan["o_proj"]
+        channel_mask = plan["channel_mask"]
+
+        with torch.no_grad():
+            q_proj.weight[channel_mask, :] = 0.0
+            k_proj.weight[channel_mask, :] = 0.0
+            v_proj.weight[channel_mask, :] = 0.0
+            o_proj.weight[:, channel_mask] = 0.0
+            if q_proj.bias is not None:
+                q_proj.bias[channel_mask] = 0.0
+            if k_proj.bias is not None:
+                k_proj.bias[channel_mask] = 0.0
+            if v_proj.bias is not None:
+                v_proj.bias[channel_mask] = 0.0
+
+
+def _apply_mlp_masking(plans: list[dict[str, Any]]) -> None:
+    for plan in plans:
+        gate_proj = plan["gate_proj"]
+        up_proj = plan["up_proj"]
+        down_proj = plan["down_proj"]
+        prune_idx = plan["prune_idx"]
+
+        with torch.no_grad():
+            gate_proj.weight[prune_idx, :] = 0.0
+            up_proj.weight[prune_idx, :] = 0.0
+            down_proj.weight[:, prune_idx] = 0.0
+            if gate_proj.bias is not None:
+                gate_proj.bias[prune_idx] = 0.0
+            if up_proj.bias is not None:
+                up_proj.bias[prune_idx] = 0.0
+
+
+def _try_physical_head_prune(
+    model: torch.nn.Module,
+    heads_to_prune: dict[int, list[int]],
+    logger: Any | None = None,
+) -> bool:
+    """Try architecture-provided physical attention head pruning APIs."""
+    if not heads_to_prune:
+        return False
+
+    for target in (model, getattr(model, "model", None)):
+        if target is None:
+            continue
+        prune_fn = getattr(target, "prune_heads", None)
+        if not callable(prune_fn):
+            continue
+
+        try:
+            prune_fn(heads_to_prune)
+            return True
+        except Exception as exc:
+            if logger is not None:
+                logger.warning("Physical head prune API failed: %s", exc)
+
+    return False
+
+
+def _try_physical_mlp_prune(
+    model: torch.nn.Module,
+    plans: list[dict[str, Any]],
+    config: Any,
+    logger: Any | None = None,
+) -> bool:
+    """Try physical MLP neuron pruning for LLaMA-like gate/up/down blocks only."""
+    if not plans:
+        return False
+
+    if not _is_llama_like_mlp_model(model):
+        if logger is not None:
+            logger.warning(
+                "Physical MLP pruning is supported only for "
+                "LLaMA-like gate/up/down blocks."
+            )
+        return False
+
+    try:
+        for plan in plans:
+            gate_name = plan["gate_name"]
+            up_name = plan["up_name"]
+            down_name = plan["down_name"]
+            prune_idx = plan["prune_idx"]
+            intermediate = int(plan["intermediate"])
+
+            keep_mask = torch.ones(intermediate, dtype=torch.bool, device=prune_idx.device)
+            keep_mask[prune_idx] = False
+            keep_idx = torch.where(keep_mask)[0]
+            if keep_idx.numel() < int(config.min_mlp_neurons):
+                return False
+
+            parent_path = gate_name.rsplit(".", 1)[0]
+            parent_module = model.get_submodule(parent_path)
+
+            gate_proj = model.get_submodule(gate_name)
+            up_proj = model.get_submodule(up_name)
+            down_proj = model.get_submodule(down_name)
+
+            if not (
+                isinstance(gate_proj, torch.nn.Linear)
+                and isinstance(up_proj, torch.nn.Linear)
+                and isinstance(down_proj, torch.nn.Linear)
+            ):
+                return False
+
+            new_intermediate = int(keep_idx.numel())
+            new_gate = torch.nn.Linear(
+                gate_proj.in_features,
+                new_intermediate,
+                bias=gate_proj.bias is not None,
+            )
+            new_up = torch.nn.Linear(
+                up_proj.in_features,
+                new_intermediate,
+                bias=up_proj.bias is not None,
+            )
+            new_down = torch.nn.Linear(
+                new_intermediate,
+                down_proj.out_features,
+                bias=down_proj.bias is not None,
+            )
+
+            new_gate.to(device=gate_proj.weight.device, dtype=gate_proj.weight.dtype)
+            new_up.to(device=up_proj.weight.device, dtype=up_proj.weight.dtype)
+            new_down.to(device=down_proj.weight.device, dtype=down_proj.weight.dtype)
+
+            with torch.no_grad():
+                new_gate.weight.copy_(gate_proj.weight[keep_idx, :])
+                if gate_proj.bias is not None and new_gate.bias is not None:
+                    new_gate.bias.copy_(gate_proj.bias[keep_idx])
+
+                new_up.weight.copy_(up_proj.weight[keep_idx, :])
+                if up_proj.bias is not None and new_up.bias is not None:
+                    new_up.bias.copy_(up_proj.bias[keep_idx])
+
+                new_down.weight.copy_(down_proj.weight[:, keep_idx])
+                if down_proj.bias is not None and new_down.bias is not None:
+                    new_down.bias.copy_(down_proj.bias)
+
+            setattr(parent_module, "gate_proj", new_gate)
+            setattr(parent_module, "up_proj", new_up)
+            setattr(parent_module, "down_proj", new_down)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("Physical MLP pruning failed: %s", exc)
+        return False
+
+    return True
+
+
+def _extract_layer_index(module_name: str) -> int | None:
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", module_name)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _is_llama_like_mlp_model(model: torch.nn.Module) -> bool:
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None or not isinstance(layers, torch.nn.ModuleList) or len(layers) == 0:
+        return False
+
+    first = layers[0]
+    mlp = getattr(first, "mlp", None)
+    if mlp is None:
+        return False
+
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    down = getattr(mlp, "down_proj", None)
+    return (
+        isinstance(gate, torch.nn.Linear)
+        and isinstance(up, torch.nn.Linear)
+        and isinstance(down, torch.nn.Linear)
+    )
+
+
+def _resolve_pruning_mode_used(
+    requested_mode: str,
+    head_physical_success: bool,
+    mlp_physical_success: bool,
+) -> str:
+    req = requested_mode.lower().strip()
+    if req != "physical":
+        return "masking"
+
+    if head_physical_success and mlp_physical_success:
+        return "physical"
+    if head_physical_success or mlp_physical_success:
+        return "mixed"
+    return "masking"
+
+
+def _estimate_speedup_potential(
+    pruned_heads: int,
+    total_heads: int,
+    pruned_neurons: int,
+    total_neurons: int,
+    pruned_layers: int,
+    total_layers: int,
+    physical_head_success: bool,
+    physical_mlp_success: bool,
+) -> float:
+    """Heuristic speedup estimate from structured pruning ratios.
+
+    This is an estimate for reporting only, not a guaranteed runtime speedup.
+    """
+    head_frac = pruned_heads / max(1, total_heads)
+    mlp_frac = pruned_neurons / max(1, total_neurons)
+    layer_frac = pruned_layers / max(1, total_layers) if total_layers > 0 else 0.0
+
+    head_coeff = 0.30 if physical_head_success else 0.05
+    mlp_coeff = 0.45 if physical_mlp_success else 0.08
+    layer_coeff = 0.60
+
+    gain = (head_coeff * head_frac) + (mlp_coeff * mlp_frac) + (layer_coeff * layer_frac)
+    return float(max(1.0, 1.0 + gain))
 
 
 def _reduce_feature_abs_mean(tensor: torch.Tensor) -> torch.Tensor:
@@ -536,7 +905,15 @@ def _layer_block_prefix(module_name: str) -> str:
 def _validate_pruning_config(config: Any) -> None:
     method = str(config.method).lower().strip()
     if method != "structured":
-        raise ValueError(f"Unsupported pruning method '{config.method}'. Only 'structured' is implemented.")
+        raise ValueError(
+            f"Unsupported pruning method '{config.method}'. "
+            "Only 'structured' is implemented."
+        )
+
+    mode = str(getattr(config, "pruning_mode", "masking")).lower().strip()
+    if mode not in {"masking", "physical"}:
+        raise ValueError(f"pruning_mode must be one of ['masking', 'physical'], got '{mode}'")
+
     if not (0.0 <= float(config.prune_ratio) < 1.0):
         raise ValueError(f"prune_ratio must be in [0, 1), got {config.prune_ratio}")
     if not (0.0 <= float(config.beta) <= 1.0):

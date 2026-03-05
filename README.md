@@ -40,7 +40,8 @@ Pruned Student                                 |
 │   ├── dapd_example.yaml
 │   └── dapd_mps_safe.yaml
 ├── scripts/
-│   └── run_pipeline.py
+│   ├── run_pipeline.py
+│   └── run_ablation.py
 └── src/dapd/
     ├── adaptation.py
     ├── config.py
@@ -78,12 +79,46 @@ python -m pip install -e .[qlora]
 PYTHONPATH=src python scripts/run_pipeline.py --config configs/dapd_example.yaml
 ```
 
+## Run Ablation (Paper-Ready)
+
+Run 4 ablations with programmatic YAML overrides:
+
+- `full`: adaptation + KL distillation + pruning
+- `no_adapt`: skip adaptation (use base teacher directly)
+- `no_kd`: CE-only student training (`distillation.use_kl=false`)
+- `no_prune`: skip pruning
+
+```bash
+PYTHONPATH=src python scripts/run_ablation.py --config configs/dapd_example.yaml
+```
+
+Artifacts are written to `runs/dapd/ablation/{variant}/...`.
+
 Artifacts are saved under `runs/dapd/...`:
 
 - `runs/dapd/config_used.yaml`
 - `runs/dapd/pipeline_summary.json`
 - `runs/dapd/eval_metrics.json`
 - stage outputs: `runs/dapd/domain_teacher`, `runs/dapd/distilled_student`, `runs/dapd/pruned_student`
+
+## Evaluation JSON Example
+
+`runs/dapd/eval_metrics.json` includes efficiency metrics:
+
+```json
+{
+  "compression_ratio": 2.4,
+  "throughput_tokens_per_sec": 132.8,
+  "speedup_vs_teacher": 1.7,
+  "latency_ms": 84.2,
+  "memory_usage_mb": 6134.5,
+  "efficiency": {
+    "compression_ratio": 2.4,
+    "throughput_tokens_per_sec": 132.8,
+    "speedup_vs_teacher": 1.7
+  }
+}
+```
 
 ## Progressive Distillation Details
 

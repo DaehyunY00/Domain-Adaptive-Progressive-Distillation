@@ -177,6 +177,13 @@ def prepare_teacher_logits_source(
         temperature_schedule=distillation_config.temperature_schedule,
     )
 
+    if not bool(getattr(distillation_config, "use_kl", True)):
+        return TeacherLogitsSource(
+            teacher_model=None,
+            use_kl=False,
+            teacher_path=adaptation_artifacts.teacher_path,
+        )
+
     teacher_tokenizer = AutoTokenizer.from_pretrained(adaptation_artifacts.teacher_path, use_fast=True)
     student_tokenizer = AutoTokenizer.from_pretrained(distillation_config.student_model_name_or_path, use_fast=True)
 

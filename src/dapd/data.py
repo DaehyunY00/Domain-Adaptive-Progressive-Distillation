@@ -8,6 +8,8 @@ from typing import Any
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from transformers import PreTrainedTokenizerBase
 
+TOKENIZATION_PREPROCESSING_VERSION = "v1"
+
 
 PROMPT_TEMPLATE = """### Domain Task
 {prompt}
@@ -54,12 +56,21 @@ def prepare_datasets_from_unified(
     config: Any,
     tokenizer: PreTrainedTokenizerBase,
 ) -> PreparedDatasets:
+    dataset_names = list(getattr(config, "datasets", []))
+    seed = int(getattr(config, "seed", 42))
+    preprocessing_version = str(
+        getattr(config, "preprocessing_version", TOKENIZATION_PREPROCESSING_VERSION)
+    )
+
     train_lm = tokenize_for_causal_lm(
         unified["train"],
         tokenizer=tokenizer,
         max_length=config.max_length,
         num_proc=config.num_proc,
         split_name="train",
+        dataset_names=dataset_names,
+        seed=seed,
+        preprocessing_version=preprocessing_version,
         tokenized_cache_dir=config.tokenized_cache_dir,
         enable_map_cache=config.enable_map_cache,
     )
@@ -69,6 +80,9 @@ def prepare_datasets_from_unified(
         max_length=config.max_length,
         num_proc=config.num_proc,
         split_name="validation",
+        dataset_names=dataset_names,
+        seed=seed,
+        preprocessing_version=preprocessing_version,
         tokenized_cache_dir=config.tokenized_cache_dir,
         enable_map_cache=config.enable_map_cache,
     )
@@ -78,6 +92,9 @@ def prepare_datasets_from_unified(
         max_length=config.max_length,
         num_proc=config.num_proc,
         split_name="test",
+        dataset_names=dataset_names,
+        seed=seed,
+        preprocessing_version=preprocessing_version,
         tokenized_cache_dir=config.tokenized_cache_dir,
         enable_map_cache=config.enable_map_cache,
     )
@@ -136,8 +153,11 @@ def tokenize_for_causal_lm(
     max_length: int,
     num_proc: int,
     split_name: str,
-    tokenized_cache_dir: str,
-    enable_map_cache: bool,
+    tokenized_cache_dir: str = "runs/dapd/cache/tokenized",
+    enable_map_cache: bool = True,
+    dataset_names: list[str] | tuple[str, ...] | None = None,
+    seed: int = 42,
+    preprocessing_version: str = TOKENIZATION_PREPROCESSING_VERSION,
 ) -> Dataset:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -164,13 +184,21 @@ def tokenize_for_causal_lm(
     cache_file = _tokenize_cache_file(
         tokenized_cache_dir=tokenized_cache_dir,
         tokenizer=tokenizer,
+        dataset=dataset,
+        dataset_names=dataset_names,
+        seed=seed,
         max_length=max_length,
         split_name=split_name,
+        preprocessing_version=preprocessing_version,
     )
+    if enable_map_cache and cache_file.exists():
+        return Dataset.from_file(str(cache_file))
+
+    map_num_proc = int(num_proc) if int(num_proc) > 1 else None
     tokenized = dataset.map(
         _tokenize,
         remove_columns=dataset.column_names,
-        num_proc=max(1, num_proc),
+        num_proc=map_num_proc,
         load_from_cache_file=enable_map_cache,
         cache_file_name=str(cache_file),
     )
@@ -265,12 +293,33 @@ def _map_medmcqa(ex: dict[str, Any]) -> dict[str, str]:
 def _tokenize_cache_file(
     tokenized_cache_dir: str,
     tokenizer: PreTrainedTokenizerBase,
+    dataset: Dataset,
+    dataset_names: list[str] | tuple[str, ...] | None,
+    seed: int,
     max_length: int,
     split_name: str,
+    preprocessing_version: str,
 ) -> Path:
     out_dir = Path(tokenized_cache_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    tok_name = getattr(tokenizer, "name_or_path", "tokenizer")
-    key = f"{tok_name}|{tokenizer.vocab_size}|{max_length}|{split_name}"
+
+    dataset_key = ",".join(str(name).strip().lower() for name in (dataset_names or []))
+    dataset_fingerprint = str(getattr(dataset, "_fingerprint", "no_fingerprint"))
+    tokenizer_id = _tokenizer_cache_id(tokenizer)
+    template_hash = hashlib.sha1(PROMPT_TEMPLATE.encode("utf-8")).hexdigest()[:8]
+    key = (
+        f"v={preprocessing_version}|datasets={dataset_key}|seed={seed}|split={split_name}|"
+        f"max_len={max_length}|tokenizer={tokenizer_id}|prompt={template_hash}|"
+        f"data_fp={dataset_fingerprint}"
+    )
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
     return out_dir / f"{split_name}_{digest}.arrow"
+
+
+def _tokenizer_cache_id(tokenizer: PreTrainedTokenizerBase) -> str:
+    name = str(getattr(tokenizer, "name_or_path", "tokenizer"))
+    vocab_size = str(getattr(tokenizer, "vocab_size", "na"))
+    init_kwargs = getattr(tokenizer, "init_kwargs", {}) or {}
+    revision = str(init_kwargs.get("revision", "default"))
+    tok_class = tokenizer.__class__.__name__
+    return f"{tok_class}:{name}@{revision}:vocab={vocab_size}"

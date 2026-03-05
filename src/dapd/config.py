@@ -10,6 +10,7 @@ import yaml
 @dataclass
 class DataConfig:
     datasets: list[str] = field(default_factory=lambda: ["pubmed_qa", "sciq", "medmcqa"])
+    preprocessing_version: str = "v1"
     train_split: str = "train"
     validation_split: str = "validation"
     test_split: str = "test"
@@ -26,6 +27,7 @@ class DataConfig:
 
 @dataclass
 class AdaptationConfig:
+    enabled: bool = True
     teacher_model_name_or_path: str = "Qwen/Qwen2.5-3B-Instruct"
     output_dir: str = "runs/dapd/domain_teacher"
     learning_rate: float = 2e-4
@@ -53,6 +55,7 @@ class AdaptationConfig:
 
 @dataclass
 class DistillationConfig:
+    use_kl: bool = True
     student_model_name_or_path: str = "Qwen/Qwen2.5-1.5B-Instruct"
     output_dir: str = "runs/dapd/distilled_student"
     learning_rate: float = 2e-4
@@ -80,6 +83,7 @@ class DistillationConfig:
 class PruningConfig:
     enabled: bool = True
     method: str = "structured"
+    pruning_mode: str = "masking"  # masking | physical
     output_dir: str = "runs/dapd/pruned_student"
     prune_ratio: float = 0.2
     beta: float = 0.5

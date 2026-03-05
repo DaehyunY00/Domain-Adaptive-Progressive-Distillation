@@ -3,9 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from types import SimpleNamespace
 
+from dapd.adaptation import AdaptationArtifacts
 from dapd.distillation import (
     _compute_masked_kl_loss,
+    prepare_teacher_logits_source,
     _resolve_kl_usage,
     _scheduled_temperature,
 )
@@ -146,3 +149,41 @@ def test_temperature_schedule_linear_and_cosine() -> None:
     t_cos_end = _scheduled_temperature(9, 10, base_temperature=2.0, min_temperature=1.0, schedule="cosine")
     assert t_cos_start == pytest.approx(2.0)
     assert t_cos_end == pytest.approx(1.0)
+
+
+def test_prepare_teacher_logits_source_respects_use_kl_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("tokenizer/model load should be skipped when use_kl=false")
+
+    monkeypatch.setattr("dapd.distillation.AutoTokenizer.from_pretrained", _raise)
+    monkeypatch.setattr("dapd.distillation.load_adapted_teacher_for_inference", _raise)
+
+    distillation_config = SimpleNamespace(
+        use_kl=False,
+        alpha=0.7,
+        temperature=2.0,
+        min_temperature=1.0,
+        temperature_schedule="constant",
+        student_model_name_or_path="dummy/student",
+        allow_kl_fallback_to_ce=False,
+    )
+    runtime = SimpleNamespace(device="cpu", fp16=False, bf16=False)
+    adaptation_artifacts = AdaptationArtifacts(
+        teacher_path="dummy/teacher",
+        adapter_path="dummy/teacher",
+        merged_teacher_path=None,
+        model_size_mb=0.0,
+    )
+
+    source = prepare_teacher_logits_source(
+        distillation_config=distillation_config,
+        runtime=runtime,
+        adaptation_artifacts=adaptation_artifacts,
+        teacher_base_model_name_or_path="dummy/base-teacher",
+    )
+
+    assert source.use_kl is False
+    assert source.teacher_model is None

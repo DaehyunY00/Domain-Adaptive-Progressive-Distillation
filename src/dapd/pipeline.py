@@ -51,16 +51,34 @@ class DAPDPipeline:
             len(unified["test"]),
         )
 
-        # Step 1: Domain adaptation (general teacher -> domain teacher)
-        teacher_tokenizer = AutoTokenizer.from_pretrained(cfg.adaptation.teacher_model_name_or_path, use_fast=True)
-        teacher_data = prepare_datasets_from_unified(unified=unified, config=cfg.data, tokenizer=teacher_tokenizer)
-
-        adapt_artifacts: AdaptationArtifacts = run_domain_adaptation(
-            config=cfg.adaptation,
-            runtime=cfg.runtime,
-            datasets=teacher_data,
-        )
-        logger.info("step1 complete | domain_teacher=%s", adapt_artifacts.teacher_path)
+        # Step 1: Domain adaptation (general teacher -> domain teacher).
+        if cfg.adaptation.enabled:
+            teacher_tokenizer = AutoTokenizer.from_pretrained(
+                cfg.adaptation.teacher_model_name_or_path,
+                use_fast=True,
+            )
+            teacher_data = prepare_datasets_from_unified(
+                unified=unified,
+                config=cfg.data,
+                tokenizer=teacher_tokenizer,
+            )
+            adapt_artifacts = run_domain_adaptation(
+                config=cfg.adaptation,
+                runtime=cfg.runtime,
+                datasets=teacher_data,
+            )
+            logger.info("step1 complete | domain_teacher=%s", adapt_artifacts.teacher_path)
+        else:
+            adapt_artifacts = AdaptationArtifacts(
+                teacher_path=cfg.adaptation.teacher_model_name_or_path,
+                adapter_path=cfg.adaptation.teacher_model_name_or_path,
+                merged_teacher_path=None,
+                model_size_mb=0.0,
+            )
+            logger.info(
+                "step1 skipped | using base teacher directly: %s",
+                adapt_artifacts.teacher_path,
+            )
 
         # Step 2: Prepare teacher logits source for progressive distillation.
         teacher_logits_source: TeacherLogitsSource = prepare_teacher_logits_source(

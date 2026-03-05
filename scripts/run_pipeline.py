@@ -3,7 +3,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+
+def _ensure_local_src_on_path() -> None:
+    """Allow running this script without editable install.
+
+    Keeps CLI compatibility for:
+      python scripts/run_pipeline.py --config ...
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    src_dir = repo_root / "src"
+    if src_dir.is_dir():
+        src_path = str(src_dir)
+        if src_path not in sys.path:
+            sys.path.insert(0, src_path)
+
+
+_ensure_local_src_on_path()
 
 from dapd.pipeline import DAPDPipeline
 
