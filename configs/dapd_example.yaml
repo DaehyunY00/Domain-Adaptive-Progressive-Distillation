@@ -1,0 +1,84 @@
+data:
+  datasets: ["pubmed_qa", "sciq", "medmcqa"]
+  seed: 42
+  max_train_samples: 1200
+  max_eval_samples: 128
+  max_length: 256
+  num_proc: 1
+  cache_dir: "./cache/hf"
+  tokenized_cache_dir: "./runs/dapd/cache/tokenized"
+  enable_map_cache: true
+
+adaptation:
+  teacher_model_name_or_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  output_dir: "./runs/dapd/domain_teacher"
+  learning_rate: 0.00015
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  warmup_ratio: 0.03
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  evaluation_strategy: "no"
+  save_strategy: "epoch"
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  use_qlora: false
+  gradient_checkpointing: true
+
+# KL distillation requires tokenizer compatibility.
+# Keep teacher/student in same model family for best results.
+distillation:
+  student_model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  output_dir: "./runs/dapd/distilled_student"
+  learning_rate: 0.0002
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  eval_steps: 200
+  save_steps: 200
+  evaluation_strategy: "no"
+  save_strategy: "epoch"
+  gradient_checkpointing: true
+  alpha: 0.7
+  temperature: 2.0
+  temperature_schedule: "linear"
+  min_temperature: 1.0
+  allow_kl_fallback_to_ce: false
+
+pruning:
+  enabled: true
+  method: "structured"
+  output_dir: "./runs/dapd/pruned_student"
+  prune_ratio: 0.1
+  beta: 0.5
+  calibration_batches: 8
+  calibration_batch_size: 1
+  enable_attention_head_pruning: true
+  enable_mlp_pruning: true
+  enable_layer_pruning: false
+  layer_prune_ratio: 0.0
+  min_heads_per_layer: 1
+  min_mlp_neurons: 32
+
+evaluation:
+  enabled: true
+  output_file: "./runs/dapd/eval_metrics.json"
+  max_eval_samples: 64
+  batch_size: 1
+  max_new_tokens: 16
+  generation_temperature: 0.0
+  num_latency_samples: 5
+
+runtime:
+  seed: 42
+  deterministic: true
+  device: "auto"
+  fp16: false
+  bf16: false
+  dataloader_num_workers: 0
+  log_level: "INFO"
