@@ -209,6 +209,27 @@ def test_throughput_is_finite_and_non_negative() -> None:
     assert perf["tokens_processed"] >= 0.0
 
 
+def test_empty_prompt_latency_returns_complete_zero_metrics() -> None:
+    model = DummyEvalModel(param_count=8)
+    tokenizer = DummyTokenizer()
+
+    perf = evaluation_module._measure_generation_performance_on_prompts(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=[],
+        max_new_tokens=6,
+        device=torch.device("cpu"),
+    )
+
+    assert perf["latency_ms"] == pytest.approx(0.0)
+    assert perf["p50_latency_ms"] == pytest.approx(0.0)
+    assert perf["p95_latency_ms"] == pytest.approx(0.0)
+    assert perf["throughput_tokens_per_sec"] == pytest.approx(0.0)
+    assert perf["tokens_processed"] == pytest.approx(0.0)
+    assert perf["inference_time_sec"] == pytest.approx(0.0)
+    assert perf["samples"] == pytest.approx(0.0)
+
+
 def test_latency_benchmark_respects_timed_runs() -> None:
     model = DummyEvalModel(param_count=8)
     tokenizer = DummyTokenizer()

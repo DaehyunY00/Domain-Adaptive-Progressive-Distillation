@@ -55,6 +55,7 @@ class AdaptationConfig:
     bf16: bool = False
     gradient_checkpointing: bool = True
     max_grad_norm: float = 1.0
+    optim: str = "adamw_torch"  # "adafactor" on memory-constrained devices
 
 
 @dataclass
@@ -81,6 +82,7 @@ class DistillationConfig:
     min_temperature: float = 1.0
     allow_kl_fallback_to_ce: bool = False
     max_grad_norm: float = 1.0
+    optim: str = "adamw_torch"  # "adafactor" on memory-constrained devices
 
 
 @dataclass
@@ -168,7 +170,7 @@ class PipelineConfig:
         with config_path.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
 
-        base_dir = config_path.parent
+        base_dir = _config_base_dir(config_path)
 
         data = DataConfig(**raw.get("data", {}))
         adaptation = AdaptationConfig(**raw.get("adaptation", {}))
@@ -216,3 +218,11 @@ def _resolve_path(base_dir: Path, value: str) -> str:
     if path.is_absolute():
         return str(path)
     return str((base_dir / path).resolve())
+
+
+def _config_base_dir(config_path: Path) -> Path:
+    config_path = config_path.expanduser().resolve()
+    for parent in (config_path.parent, *config_path.parents):
+        if parent.name == "configs":
+            return parent.parent
+    return config_path.parent

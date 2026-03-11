@@ -48,3 +48,18 @@ def test_run_multiseed_experiment_help_smoke() -> None:
 
     assert proc.returncode == 0
     assert "Run DAPD multi-seed experiment" in proc.stdout
+
+
+def test_run_full_experiment_help_smoke() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_full_experiment.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert "Run the full DAPD experiment suite" in proc.stdout

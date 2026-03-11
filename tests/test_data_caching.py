@@ -155,3 +155,32 @@ def test_tokenize_for_causal_lm_uses_existing_cache_without_mapping(
     )
 
     assert len(first) == len(second)
+
+
+def test_tokenize_for_causal_lm_preserves_supervised_target_tokens_with_small_max_length(
+    tmp_path: Path,
+) -> None:
+    tok = DummyTokenizer()
+    ds = Dataset.from_dict(
+        {
+            "prompt": ["long prompt " * 40],
+            "target": ["final answer"],
+        }
+    )
+
+    tokenized = tokenize_for_causal_lm(
+        dataset=ds,
+        tokenizer=tok,
+        max_length=8,
+        num_proc=1,
+        split_name="train",
+        dataset_names=["pubmed_qa"],
+        seed=42,
+        preprocessing_version="v2",
+        tokenized_cache_dir=str(tmp_path),
+        enable_map_cache=False,
+    )
+
+    labels = tokenized[0]["labels"]
+    assert len(labels) <= 8
+    assert any(label != -100 for label in labels)

@@ -137,15 +137,11 @@ def build_unified_dataset(config: Any) -> DatasetDict:
         if datasets_list:
             merged[split] = concatenate_datasets(datasets_list).shuffle(seed=config.seed)
 
-    if "validation" not in merged:
-        split_data = merged["train"].train_test_split(test_size=0.1, seed=config.seed)
-        merged["train"] = split_data["train"]
-        merged["validation"] = split_data["test"]
+    if len(merged["train"]) == 0:
+        raise ValueError("Unified train split is empty after dataset mapping/filtering.")
 
-    if "test" not in merged:
-        split_data = merged["train"].train_test_split(test_size=0.1, seed=config.seed + 1)
-        merged["train"] = split_data["train"]
-        merged["test"] = split_data["test"]
+    _ensure_nonempty_holdout_split(merged=merged, split_name="validation", seed=int(config.seed))
+    _ensure_nonempty_holdout_split(merged=merged, split_name="test", seed=int(config.seed) + 1)
 
     if config.max_train_samples:
         merged["train"] = merged["train"].select(range(min(config.max_train_samples, len(merged["train"]))))
@@ -239,21 +235,27 @@ def tokenize_for_causal_lm(
     def _tokenize(example: dict[str, str]) -> dict[str, Any]:
         prompt_text = PROMPT_TEMPLATE.format(prompt=example["prompt"])
         target = str(example["target"]).strip()
-        full_text = f"{prompt_text}{target}"
+        prompt_ids = tokenizer(prompt_text, truncation=False, add_special_tokens=False)["input_ids"]
+        target_ids = tokenizer(target, truncation=False, add_special_tokens=False)["input_ids"]
 
-        full_enc = tokenizer(full_text, truncation=True, max_length=max_length)
-        prompt_enc = tokenizer(prompt_text, truncation=True, max_length=max_length, add_special_tokens=False)
+        if not target_ids:
+            fallback_token_id = getattr(tokenizer, "eos_token_id", None)
+            target_ids = [int(fallback_token_id)] if fallback_token_id is not None else [0]
 
-        labels = list(full_enc["input_ids"])
-        mask_until = min(len(prompt_enc["input_ids"]), len(labels))
-        for i in range(mask_until):
-            labels[i] = -100
+        target_budget = min(len(target_ids), max(1, int(max_length)))
+        target_ids = list(target_ids[:target_budget])
+        prompt_budget = max(0, int(max_length) - len(target_ids))
 
-        return {
-            "input_ids": full_enc["input_ids"],
-            "attention_mask": full_enc["attention_mask"],
-            "labels": labels,
-        }
+        if prompt_budget > 0 and len(prompt_ids) > prompt_budget:
+            prompt_ids = prompt_ids[-prompt_budget:]
+        else:
+            prompt_ids = prompt_ids[:prompt_budget]
+
+        input_ids = list(prompt_ids) + list(target_ids)
+        attention_mask = [1] * len(input_ids)
+        labels = ([-100] * len(prompt_ids)) + list(target_ids)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     cache_file = _tokenize_cache_file(
         tokenized_cache_dir=tokenized_cache_dir,
@@ -381,40 +383,26 @@ def _map_medmcqa(ex: dict[str, Any]) -> dict[str, str]:
     return {"domain": "medmcqa", "prompt": prompt, "target": answer}
 
 
-def _load_bioasq(cache_dir: str | None) -> DatasetDict:
-    """Load BioASQ from HF Hub using a permissive config fallback chain."""
-    candidates: list[tuple[str, str | None]] = [
-        ("bioasq", None),
-        ("bioasq", "Task10BGoldenEnriched"),
-        ("bioasq", "Task10B"),
-    ]
-
-    last_error: Exception | None = None
-    for name, config_name in candidates:
-        try:
-            if config_name is None:
-                raw = load_dataset(name, cache_dir=cache_dir)
-            else:
-                raw = load_dataset(name, config_name, cache_dir=cache_dir)
-            if not isinstance(raw, DatasetDict):
-                continue
-            return raw
-        except Exception as exc:  # pragma: no cover - depends on remote dataset metadata.
-            last_error = exc
-            continue
-
-    msg = "Failed to load BioASQ dataset from Hugging Face (`bioasq`)."
-    if last_error is not None:
-        msg += f" Last error: {last_error}"
-    raise ValueError(msg)
-
 
 def _map_bioasq(ex: dict[str, Any]) -> dict[str, str]:
     question = str(ex.get("body", ex.get("question", ""))).strip()
+
+    # Standard BioASQ fields (e.g., bigbio / official format)
     answer = ex.get("exact_answer", ex.get("ideal_answer", ""))
     if isinstance(answer, list):
         answer = answer[0] if answer else ""
     answer = str(answer).strip()
+
+    # kroshan/BioASQ format: answer embedded in 'text' as '<answer> ANSWER <context> …'
+    # If neither exact_answer nor ideal_answer is present, parse the text field.
+    if not answer:
+        text = str(ex.get("text", "")).strip()
+        if "<answer>" in text:
+            after_answer = text.split("<answer>", 1)[1].strip()
+            if "<context>" in after_answer:
+                answer = after_answer.split("<context>", 1)[0].strip()
+            else:
+                answer = after_answer
 
     prompt = f"[Biomedical QA]\nQuestion: {question}\n\nAnswer:"
     return {"domain": "bioasq", "prompt": prompt, "target": answer}
@@ -453,3 +441,27 @@ def _tokenizer_cache_id(tokenizer: PreTrainedTokenizerBase) -> str:
     revision = str(init_kwargs.get("revision", "default"))
     tok_class = tokenizer.__class__.__name__
     return f"{tok_class}:{name}@{revision}:vocab={vocab_size}"
+
+
+def _ensure_nonempty_holdout_split(
+    merged: dict[str, Dataset],
+    split_name: str,
+    seed: int,
+) -> None:
+    existing = merged.get(split_name)
+    if existing is not None and len(existing) > 0:
+        return
+
+    train = merged.get("train")
+    if train is None or len(train) == 0:
+        raise ValueError(f"Cannot materialize non-empty '{split_name}' split without train data.")
+
+    if len(train) < 2:
+        merged[split_name] = train
+        return
+
+    holdout_size = max(1, int(round(len(train) * 0.1)))
+    holdout_size = min(holdout_size, len(train) - 1)
+    split_data = train.train_test_split(test_size=holdout_size, seed=seed)
+    merged["train"] = split_data["train"]
+    merged[split_name] = split_data["test"]

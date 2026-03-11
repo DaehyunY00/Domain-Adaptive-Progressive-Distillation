@@ -8,6 +8,7 @@ from dapd.data import (
     _load_domain_dataset,
     _map_bioasq,
     _map_medmcqa,
+    build_unified_dataset,
     build_external_eval_dataset,
     build_ood_dataset,
 )
@@ -114,3 +115,41 @@ def test_map_medmcqa_prefers_one_indexed_cop() -> None:
     }
     mapped = _map_medmcqa(ex)
     assert mapped["target"] == "A"
+
+
+def test_build_unified_dataset_backfills_empty_test_split(monkeypatch) -> None:
+    train = Dataset.from_dict(
+        {
+            "domain": ["x"] * 10,
+            "prompt": [f"train-{i}" for i in range(10)],
+            "target": [f"answer-{i}" for i in range(10)],
+        }
+    )
+    validation = Dataset.from_dict(
+        {
+            "domain": ["x"] * 2,
+            "prompt": ["val-1", "val-2"],
+            "target": ["a", "b"],
+        }
+    )
+    empty_test = Dataset.from_dict({"domain": [], "prompt": [], "target": []})
+
+    monkeypatch.setattr(
+        "dapd.data._load_domain_dataset",
+        lambda *args, **kwargs: DatasetDict(
+            {"train": train, "validation": validation, "test": empty_test}
+        ),
+    )
+
+    cfg = SimpleNamespace(
+        datasets=["pubmed_qa"],
+        cache_dir=None,
+        seed=42,
+        max_train_samples=None,
+        max_eval_samples=None,
+    )
+    out = build_unified_dataset(cfg)
+
+    assert len(out["train"]) > 0
+    assert len(out["validation"]) > 0
+    assert len(out["test"]) > 0

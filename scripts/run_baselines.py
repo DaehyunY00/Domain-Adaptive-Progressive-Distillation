@@ -37,7 +37,18 @@ from dapd.pruning import run_structured_pruning
 from dapd.utils import dump_json, ensure_dir, get_logger, set_seed
 
 
-BASELINES = ("direct_kd", "lora_only", "no_distill_prune")
+# ── Baseline 목록 ─────────────────────────────────────────────────────────────
+# zero_shot      : 학습 없이 base student(Qwen2.5-0.5B-Instruct)를 직접 평가
+#                  → 하한선. domain adaptation + KD의 절대적 기여도 측정 기준
+# student_sft    : teacher 없이 ground-truth label만으로 student CE fine-tuning
+#                  → "CE-only SFT". teacher KD 기여도를 분리하는 핵심 baseline
+# direct_kd      : teacher domain adaptation 없이 base teacher로 KD 진행
+#                  → domain adaptation의 기여도 분리
+# lora_only      : domain-adapted teacher 환경에서 student CE-only (no KL)
+#                  → KL loss의 기여도 분리
+# no_distill_prune: domain-adapted teacher를 KD 없이 직접 pruning
+#                  → KD 없는 압축 품질 비교
+BASELINES = ("zero_shot", "student_sft", "direct_kd", "lora_only", "no_distill_prune")
 MULTI_SEEDS = (42, 123, 2024)
 
 
@@ -61,7 +72,10 @@ def main() -> None:
     requested = [b.strip() for b in args.baselines.split(",") if b.strip()]
     unknown = [b for b in requested if b not in BASELINES]
     if unknown:
-        raise ValueError(f"Unsupported baselines: {unknown}. Supported: {list(BASELINES)}")
+        raise ValueError(
+            f"Unsupported baselines: {unknown}. "
+            f"Supported: {list(BASELINES)}"
+        )
 
     base_cfg = PipelineConfig.from_yaml(args.config)
     baseline_root = Path(base_cfg.distillation.output_dir).resolve().parent / "baselines"
@@ -77,7 +91,9 @@ def main() -> None:
             _apply_baseline(cfg=cfg, baseline=baseline)
 
             print(f"\n=== Running baseline: {baseline} (seed={seed}) ===")
-            if baseline == "no_distill_prune":
+            if baseline == "zero_shot":
+                summary = _run_zero_shot_baseline(cfg=cfg, run_root=run_root)
+            elif baseline == "no_distill_prune":
                 summary = _run_no_distill_prune_baseline(cfg=cfg)
             else:
                 summary = DAPDPipeline(cfg).run()
@@ -139,13 +155,32 @@ def _configure_run(cfg: PipelineConfig, seed: int, run_root: Path) -> None:
 
 
 def _apply_baseline(cfg: PipelineConfig, baseline: str) -> None:
+    # zero_shot and no_distill_prune have dedicated run functions;
+    # they are handled before _apply_baseline is called in the loop.
+    if baseline == "zero_shot":
+        # _run_zero_shot_baseline evaluates the raw student; no pipeline run needed.
+        return
+
+    if baseline == "student_sft":
+        # No teacher domain adaptation. Student trained with CE only (no KL loss).
+        # This isolates the contribution of teacher KD from CE fine-tuning.
+        cfg.adaptation.enabled = False
+        cfg.distillation.use_kl = False
+        cfg.distillation.alpha = 1.0  # pure cross-entropy against ground truth
+        cfg.pruning.enabled = False
+        return
+
     if baseline == "direct_kd":
+        # KD from a non-adapted (generic) teacher — isolates domain adaptation contribution.
         cfg.adaptation.enabled = False
         cfg.distillation.use_kl = True
         cfg.pruning.enabled = False
         return
 
     if baseline == "lora_only":
+        # Domain-adapted teacher environment, but student uses CE only (no KL).
+        # Compared to student_sft, the teacher is adapted but its knowledge is not
+        # transferred via KL — so this isolates the KL loss contribution specifically.
         cfg.adaptation.enabled = True
         cfg.distillation.use_kl = False
         cfg.distillation.alpha = 1.0
@@ -153,11 +188,63 @@ def _apply_baseline(cfg: PipelineConfig, baseline: str) -> None:
         return
 
     if baseline == "no_distill_prune":
+        # Domain-adapted teacher pruned directly, no student KD.
         cfg.adaptation.enabled = True
         cfg.pruning.enabled = True
         return
 
     raise ValueError(f"Unsupported baseline: {baseline}")
+
+
+def _run_zero_shot_baseline(cfg: PipelineConfig, run_root: Path) -> dict[str, Any]:
+    """Evaluate the raw (untrained) student model — no fine-tuning of any kind.
+
+    This is the lower bound baseline. Any improvement from DAPD over zero-shot
+    quantifies the absolute value of the full pipeline.
+    """
+    logger = get_logger("dapd.baselines", getattr(cfg.runtime, "log_level", "INFO"))
+    set_seed(cfg.runtime.seed, deterministic=cfg.runtime.deterministic)
+    ensure_dir(run_root)
+
+    eval_output_file = str(run_root / "eval_metrics.json")
+    summary_path = run_root / "pipeline_summary.json"
+
+    # Build evaluation dataset using the same data settings as the main pipeline.
+    unified = build_unified_dataset(cfg.data)
+    eval_tokenizer = AutoTokenizer.from_pretrained(
+        cfg.distillation.student_model_name_or_path, use_fast=True
+    )
+    eval_data = prepare_datasets_from_unified(
+        unified=unified,
+        config=cfg.data,
+        tokenizer=eval_tokenizer,
+    )
+
+    logger.info(
+        "baseline(zero_shot): evaluating %s without any training",
+        cfg.distillation.student_model_name_or_path,
+    )
+    eval_metrics = evaluate_model(
+        model_path=cfg.distillation.student_model_name_or_path,
+        text_dataset=eval_data.test_text,
+        lm_dataset=eval_data.test_lm,
+        config=cfg.evaluation,
+        runtime=cfg.runtime,
+    )
+    dump_json(eval_metrics, eval_output_file)
+    logger.info("zero_shot eval saved: %s", eval_output_file)
+
+    summary: dict[str, Any] = {
+        "baseline": "zero_shot",
+        "student_model": cfg.distillation.student_model_name_or_path,
+        "adaptation": None,
+        "distillation": None,
+        "pruning": None,
+        "final_model_path": cfg.distillation.student_model_name_or_path,
+        "evaluation": eval_metrics,
+    }
+    dump_json(summary, summary_path)
+    return summary
 
 
 def _run_no_distill_prune_baseline(cfg: PipelineConfig) -> dict[str, Any]:

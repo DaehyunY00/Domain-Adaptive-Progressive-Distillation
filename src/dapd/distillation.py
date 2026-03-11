@@ -23,7 +23,9 @@ from .utils import (
     configure_model_for_training,
     ensure_dir,
     get_logger,
+    get_recommended_teacher_dtype,
     infer_device,
+    resolve_training_strategy_kwargs,
     restore_model_use_cache,
     validate_runtime_precision,
 )
@@ -89,8 +91,12 @@ class ProgressiveDistillationTrainer(Trainer):
             teacher_model.eval()
             for parameter in teacher_model.parameters():
                 parameter.requires_grad_(False)
-            if self.args.device.type != "cpu":
-                teacher_model.to(self.args.device)
+            # teacher는 항상 CPU에 유지한다.
+            # MPS(Apple Silicon)에서 student + teacher를 동시에 MPS에 올리면
+            # 7GB+ MPS 사용으로 OOM이 발생한다.
+            # teacher를 CPU에 두면 MPS는 student(2GB) + gradient(2GB)만 사용.
+            # teacher logits는 compute_loss에서 청크 단위로 MPS에 전송한다.
+            teacher_model.to("cpu")
 
     def compute_loss(
         self,
@@ -107,6 +113,14 @@ class ProgressiveDistillationTrainer(Trainer):
         ce_loss = outputs.loss
         if ce_loss is None:
             raise ValueError("Model output does not include loss; ensure labels are provided.")
+
+        if not torch.isfinite(ce_loss):
+            if _has_no_supervised_tokens(labels):
+                safe_zero = outputs.logits.new_zeros(())
+                self.logger.warning("Skipping batch with no supervised target tokens after truncation.")
+                return (safe_zero, outputs) if return_outputs else safe_zero
+            self.logger.warning("Non-finite CE loss detected; zeroing this batch loss for stability.")
+            ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         if not self.teacher_logits_source.use_kl:
             return (ce_loss, outputs) if return_outputs else ce_loss
@@ -125,15 +139,24 @@ class ProgressiveDistillationTrainer(Trainer):
             schedule=self.temperature_schedule,
         )
 
-        teacher_inputs: dict[str, torch.Tensor] = {"input_ids": inputs["input_ids"]}
+        # teacher는 CPU에 있으므로 inputs도 CPU로 이동해서 forward 수행.
+        # student forward와 별개의 그래프이므로 no_grad + CPU 연산으로 MPS 부하 없음.
+        teacher_inputs: dict[str, torch.Tensor] = {
+            "input_ids": inputs["input_ids"].to("cpu"),
+        }
         if inputs.get("attention_mask") is not None:
-            teacher_inputs["attention_mask"] = inputs["attention_mask"]
+            teacher_inputs["attention_mask"] = inputs["attention_mask"].to("cpu")
 
         with torch.no_grad():
             teacher_outputs = teacher_model(**teacher_inputs)
 
         student_logits = outputs.logits
-        teacher_logits = teacher_outputs.logits.detach().to(student_logits.device)
+        # teacher_logits는 CPU에 유지한다.
+        # _compute_masked_kl_loss 내부 청크 루프에서 청크 단위로 student device(MPS)로 이동.
+        # 전체를 MPS로 한 번에 복사하면 [B, S, V] 전체가 MPS에 올라가지만,
+        # 청크별 이동은 최대 [B, 4, 152064] = ~1.2MB만 MPS에 상주한다.
+        teacher_logits = teacher_outputs.logits.detach()  # CPU 유지
+        del teacher_outputs
 
         kd_loss = _compute_masked_kl_loss(
             student_logits=student_logits,
@@ -142,8 +165,14 @@ class ProgressiveDistillationTrainer(Trainer):
             attention_mask=inputs.get("attention_mask"),
             temperature=temperature,
         )
+        if not torch.isfinite(kd_loss):
+            self.logger.warning("Non-finite KD loss detected; zeroing this batch KD loss for stability.")
+            kd_loss = torch.nan_to_num(kd_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         loss = self.alpha * ce_loss + (1.0 - self.alpha) * kd_loss
+        if not torch.isfinite(loss):
+            self.logger.warning("Combined distillation loss became non-finite; skipping batch update.")
+            loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.state.global_step % max(1, int(self.args.logging_steps)) == 0:
             self.logger.info(
@@ -204,9 +233,13 @@ def prepare_teacher_logits_source(
 
     teacher_model = None
     if use_kl:
+        # MPS(Apple Silicon)에서는 teacher를 bfloat16으로 로드해 메모리 3GB 절감.
+        # teacher는 eval-only(requires_grad=False)이므로 bfloat16 사용 안전.
+        teacher_dtype = get_recommended_teacher_dtype(device)
         teacher_model, _ = load_adapted_teacher_for_inference(
             adapt_artifacts=adaptation_artifacts,
             base_model_name_or_path=teacher_base_model_name_or_path,
+            torch_dtype=teacher_dtype,
         )
 
     return TeacherLogitsSource(
@@ -234,7 +267,14 @@ def run_progressive_distillation(
         temperature_schedule=config.temperature_schedule,
     )
 
-    student_model = AutoModelForCausalLM.from_pretrained(config.student_model_name_or_path, trust_remote_code=True)
+    # low_cpu_mem_usage: 로딩 시 CPU peak를 model_size 수준으로 억제한다.
+    # MPS(Apple Silicon)에서 student는 float32로 로드해 MPS가 직접 학습을 처리.
+    # teacher는 이미 CPU bfloat16으로 별도 로드되어 있음(prepare_teacher_logits_source).
+    student_model = AutoModelForCausalLM.from_pretrained(
+        config.student_model_name_or_path,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
     student_tokenizer = AutoTokenizer.from_pretrained(config.student_model_name_or_path, use_fast=True)
     if student_tokenizer.pad_token is None:
         student_tokenizer.pad_token = student_tokenizer.eos_token
@@ -259,8 +299,14 @@ def run_progressive_distillation(
         max_grad_norm=config.max_grad_norm,
         fp16=runtime.fp16,
         bf16=runtime.bf16,
-        evaluation_strategy=config.evaluation_strategy,
-        save_strategy=config.save_strategy,
+        # Adafactor: 2nd moment를 인수분해해 저장 → optimizer state 5.31GB → ~0.1GB 절감.
+        # lm_head[152064,896] AdamW 2nd moment 545MB → 0.6MB (1782x 절감).
+        # 논문 품질: Shazeer & Stern (2018) 수준의 표준 대안 옵티마이저.
+        optim=getattr(config, "optim", "adamw_torch"),
+        **resolve_training_strategy_kwargs(
+            evaluation_strategy=config.evaluation_strategy,
+            save_strategy=config.save_strategy,
+        ),
         remove_unused_columns=False,
         report_to="none",
         dataloader_num_workers=runtime.dataloader_num_workers,
@@ -422,28 +468,54 @@ def _compute_masked_kl_loss(
     if seq_len <= 1:
         return student_logits.new_zeros(())
 
-    # Causal LM alignment: position t predicts token at t+1.
-    student_shifted = student_logits[:, :-1, :].float() / float(temperature)
-    teacher_shifted = teacher_logits[:, :-1, :].float() / float(temperature)
-
-    student_log_probs = F.log_softmax(student_shifted, dim=-1)
-    teacher_probs = F.softmax(teacher_shifted, dim=-1)
-    token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
-
     mask = _build_causal_mask(
         labels=labels,
         attention_mask=attention_mask,
-        pred_len=token_kl.size(1),
-        batch_size=token_kl.size(0),
-        device=token_kl.device,
-        dtype=token_kl.dtype,
+        pred_len=seq_len - 1,
+        batch_size=student_logits.size(0),
+        device=student_logits.device,
+        dtype=student_logits.dtype,
     )
 
     valid_count = mask.sum()
     if valid_count.item() <= 0.0:
-        return token_kl.new_zeros(())
+        return student_logits.new_zeros(())
 
-    return ((token_kl * mask).sum() / valid_count) * (float(temperature) ** 2)
+    # Compute KL in small token chunks to avoid large [B, S, V] temporary allocations
+    # on MPS with large vocabularies.
+    pred_len = int(seq_len - 1)
+    vocab_size = int(student_logits.size(-1))
+    chunk_tokens = _resolve_kl_chunk_tokens(
+        device=student_logits.device,
+        pred_len=pred_len,
+        vocab_size=vocab_size,
+    )
+    temp = float(temperature)
+    kl_sum = student_logits.new_zeros(())
+
+    for start in range(0, pred_len, chunk_tokens):
+        end = min(pred_len, start + chunk_tokens)
+        mask_chunk = mask[:, start:end]
+        if mask_chunk.sum().item() <= 0.0:
+            continue
+
+        # Causal LM alignment: position t predicts token at t+1.
+        # teacher_logits가 CPU에 있을 경우 .to(device, dtype)으로 MPS에 올린다.
+        # 청크 크기(4 tokens × 152064 vocab × 4 bytes) = ~2.3MB → MPS 부하 미미.
+        student_chunk = student_logits[:, start:end, :] / temp
+        teacher_chunk = teacher_logits[:, start:end, :].to(
+            device=student_logits.device,
+            dtype=student_logits.dtype,
+        ) / temp
+
+        student_log_probs = F.log_softmax(student_chunk, dim=-1)
+        teacher_probs = F.softmax(teacher_chunk, dim=-1)
+        token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+        kl_sum = kl_sum + (token_kl * mask_chunk).sum()
+
+        del student_chunk, teacher_chunk, student_log_probs, teacher_probs, token_kl
+
+    return (kl_sum / valid_count) * (temp**2)
 
 
 def _build_causal_mask(
@@ -471,6 +543,31 @@ def _build_causal_mask(
         return shifted_mask.to(device=device, dtype=dtype)
 
     return torch.ones((batch_size, pred_len), device=device, dtype=dtype)
+
+
+def _resolve_kl_chunk_tokens(
+    device: torch.device,
+    pred_len: int,
+    vocab_size: int,
+) -> int:
+    """KL 계산의 토큰 청크 크기를 결정해 peak 메모리를 줄인다.
+
+    MPS에서 [B, chunk, V] 임시 텐서가 큰 vocab(Qwen: 152,064)과 결합하면
+    메모리 급증이 발생한다. 청크 크기를 줄여 peak를 제어한다.
+
+    Qwen2.5 vocab=152,064 기준 메모리:
+      float32: chunk=8  → 8 × 152,064 × 4 bytes ≈ 4.6MB per chunk
+      float32: chunk=4  → 4 × 152,064 × 4 bytes ≈ 2.3MB per chunk  (M4 16GB 권장)
+    """
+    if pred_len <= 0:
+        return 1
+    if device.type == "mps":
+        # M4 16GB Unified Memory: vocab >= 100K이면 chunk=4로 peak 메모리 억제.
+        # vocab < 100K이면 chunk=8 유지.
+        if vocab_size >= 100_000:
+            return min(pred_len, 4)
+        return min(pred_len, 8)
+    return pred_len
 
 
 def _scheduled_temperature(
@@ -525,3 +622,9 @@ def _validate_distillation_hparams(
         raise ValueError(
             f"temperature_schedule must be one of ['constant', 'linear', 'cosine'], got '{temperature_schedule}'"
         )
+
+
+def _has_no_supervised_tokens(labels: torch.Tensor | None) -> bool:
+    if labels is None or labels.ndim != 2 or labels.size(1) <= 1:
+        return False
+    return bool((labels[:, 1:] != -100).sum().item() == 0)

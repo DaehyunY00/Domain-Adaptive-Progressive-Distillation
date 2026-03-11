@@ -1,0 +1,157 @@
+# =============================================================================
+# DAPD Configuration — Full Scale (CUDA GPU: A100 / RTX4090 / RTX3090)
+# =============================================================================
+#
+# ── Top Conference 제출용 full-scale 실험 config ─────────────────────────────
+# ── 권장 환경: CUDA GPU 24GB 이상 (A100 40GB, RTX4090 24GB, RTX3090 24GB) ───
+#
+# dapd_m4_16gb.yaml 대비 주요 변경점:
+#   1. max_train_samples  null (전체 데이터 — PubMedQA 211K, MedMCQA 182K)
+#   2. max_length         256  (의료 QA 컨텍스트 전체 포함)
+#   3. adaptation epochs  3    (teacher 충분한 수렴)
+#   4. distillation epochs 5   (KD 완전 수렴 + temp schedule 3epoch 이후에도 fine-tuning)
+#   5. per_device_batch   4    (M4의 1에서 GPU VRAM 활용)
+#   6. gradient_accum     8    (effective batch = 32, M4와 동일)
+#   7. optim              adamw_torch (GPU 메모리 충분 → AdamW 복원)
+#   8. calibration_batches 32  (충분한 calibration)
+#   9. max_eval_samples   1000 (95% CI ±3.1%p)
+#  10. analysis 전체 활성화 (teacher_distribution, calibration, temperature, pruning)
+#  11. multi-seed run: scripts/run_pipeline.py --config configs/dapd_full.yaml --seed 42/0/1234
+#
+# 실행 방법:
+#   make run_full                              # seed=42 단일 실행
+#   make run_full_multiseed                    # seed 42, 0, 1234 순차 실행
+#   make run_full_suite_gpu                    # 파이프라인 + ablation + baseline + analysis
+#
+# 예상 실행 시간 (A100 기준):
+#   - Domain Adaptation: ~2-3시간
+#   - Distillation KD:   ~8-12시간
+#   - Pruning:           ~0.5시간
+#   - Evaluation:        ~1시간
+#   - Analysis:          ~2시간
+#   총합:                ~14-18시간
+# =============================================================================
+
+data:
+  datasets: ["pubmed_qa", "medmcqa"]
+  ood_datasets: ["bioasq"]
+  ood_max_samples: 500               # OOD 평가 충분한 샘플
+  preprocessing_version: "v2"
+  seed: 42
+  max_train_samples: null            # 전체 데이터 사용 (PubMedQA+MedMCQA 합산)
+  max_eval_samples: 1000             # 95% CI ±3.1%p
+  max_length: 256                    # 의료 QA 컨텍스트 전체 포함 (PubMedQA 평균 ~300 tokens)
+  num_proc: 4                        # GPU 서버 CPU 코어 활용
+  cache_dir: "./cache/hf"
+  tokenized_cache_dir: "./runs/dapd_full/cache/tokenized"
+  enable_map_cache: true
+
+adaptation:
+  enabled: true
+  teacher_model_name_or_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  output_dir: "./runs/dapd_full/domain_teacher"
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  num_train_epochs: 3                # teacher 충분한 수렴
+  per_device_train_batch_size: 4     # GPU VRAM 활용
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8    # effective batch = 32
+  warmup_ratio: 0.03
+  logging_steps: 50
+  eval_steps: 500
+  save_steps: 500
+  evaluation_strategy: "steps"
+  save_strategy: "steps"
+  lora_r: 16                         # r=8→16: 표현 용량 증가
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"]
+  use_qlora: false
+  fp16: false
+  bf16: true                         # GPU bf16 활성화 (A100/RTX4090 지원)
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  optim: "adamw_torch"               # GPU 메모리 충분 → AdamW 복원
+
+distillation:
+  use_kl: true
+  student_model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  output_dir: "./runs/dapd_full/distilled_student"
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  num_train_epochs: 5                # KD 완전 수렴
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8   # effective batch = 32
+  warmup_ratio: 0.03
+  logging_steps: 50
+  eval_steps: 500
+  save_steps: 500
+  evaluation_strategy: "steps"
+  save_strategy: "steps"
+  gradient_checkpointing: true
+  alpha: 0.5                         # CE 50%, KL 50%
+  temperature: 2.0
+  temperature_schedule: "linear"
+  min_temperature: 1.0
+  allow_kl_fallback_to_ce: false
+  max_grad_norm: 1.0
+  optim: "adamw_torch"
+
+pruning:
+  enabled: true
+  method: "structured"
+  pruning_mode: "masking"
+  output_dir: "./runs/dapd_full/pruned_student"
+  prune_ratio: 0.2
+  beta: 0.5
+  calibration_batches: 32            # 충분한 calibration
+  calibration_batch_size: 4
+  enable_attention_head_pruning: true
+  enable_mlp_pruning: true
+  enable_layer_pruning: false
+  layer_prune_ratio: 0.0
+  min_heads_per_layer: 1
+  min_mlp_neurons: 32
+
+evaluation:
+  enabled: true
+  output_file: "./runs/dapd_full/eval_metrics.json"
+  max_eval_samples: 1000             # 충분한 평가 샘플
+  batch_size: 8
+  max_new_tokens: 64                 # 의료 QA 응답 전체 생성
+  generation_temperature: 0.0
+  num_latency_samples: 50
+  latency_seq_lens: [32, 64, 128, 256]
+  latency_warmup_runs: 10
+  latency_benchmark_runs: 100
+  calibration_bins: 15
+  run_ood_test: false
+  ood_test_dataset: "bioasq"
+  ood_output_file: "./runs/dapd_full/eval_metrics_ood.json"
+  ood_max_eval_samples: 500
+
+analysis:
+  enabled: true
+  output_dir: "./runs/dapd_full/analysis"
+  max_samples: 256
+  run_teacher_distribution: true     # teacher 도메인 적응 전후 분포 비교
+  run_teacher_calibration: true      # temperature scaling calibration 분석
+  run_teacher_information: true      # mutual information 분석
+  run_temperature_analysis: true     # progressive T vs constant T 비교
+  run_distillation_intervention: false
+  run_pruning_patterns: true         # pruning pattern 시각화
+  run_baseline_comparison: true
+  temperature_steps: 100
+  intervention_teacher_small: null
+  intervention_teacher_large: null
+
+runtime:
+  seed: 42
+  deterministic: true
+  device: "auto"                     # CUDA 자동 선택
+  fp16: false
+  bf16: false                        # Trainer bf16은 adaptation.bf16에서 제어
+  dataloader_num_workers: 4
+  log_level: "INFO"

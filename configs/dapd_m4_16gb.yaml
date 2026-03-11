@@ -1,0 +1,170 @@
+# =============================================================================
+# DAPD Configuration — MacBook Pro M4 (16GB Unified Memory)  [v2 — improved]
+# =============================================================================
+#
+# ── 메모리 예산 (teacher CPU 오프로드 + Adafactor 적용 후) ────────────────────
+#
+#  [MPS]  student Qwen2.5-0.5B (float32)             ~2.0 GB
+#  [MPS]  student gradient (float32)                  ~2.0 GB
+#  [MPS]  activations (batch=1, seq=128 ← 64에서 ↑)  ~0.4 GB
+#  [MPS]  KL chunk [1,4,152064] (순간)                ~0.002 GB
+#  ───────────────────────────────────────────────────────────────
+#  MPS 합계                                           ~4.4 GB  ✅
+#
+#  [CPU]  teacher Qwen2.5-1.5B (bfloat16)            ~3.0 GB
+#  [CPU]  Adafactor optimizer state (student)         ~0.6 GB
+#  [CPU]  macOS + 기타 앱                             ~5.0 GB
+#  ───────────────────────────────────────────────────────────────
+#  CPU 합계                                           ~8.6 GB  ✅
+#
+# ── v1 → v2 주요 변경점 ──────────────────────────────────────────────────────
+#   1. max_length          64   → 128  : 의료 문맥 2배 확장, MPS +0.2 GB
+#   2. max_train_samples  800   → 5000 : 학습량 6.25배, effective steps 25→156
+#   3. max_eval_samples    64   → 300  : 신뢰 구간 폭 ±12%p → ±5.7%p (n=300)
+#   4. adaptation epochs    1   → 2   : teacher domain 수렴 강화
+#   5. distillation epochs  1   → 3   : KD 수렴 + temperature schedule 충분히 진행
+#   6. distillation alpha  0.7  → 0.5 : KL loss 비중 30%→50%, KD 효과 강화
+#   7. distillation lr  0.0001  → 0.0002: 표준값 복원
+#   8. prune_ratio         0.1  → 0.2 : 더 의미있는 압축 달성
+#   9. calibration_batches  2   → 8   : pruning importance score 정확도 향상
+#  10. max_new_tokens       16  → 32  : 의료 QA 응답 품질 향상
+#  11. ood_max_samples     100  → 200 : BioASQ OOD 평가 샘플 2배
+#  12. analysis.enabled  false  → true: teacher 분포 + temperature 분석 활성화
+#  13. lora_target_modules  4   → 7개 : MLP proj 포함 (Adafactor로 메모리 확보)
+#
+# 실행 방법:
+#   make run_m4
+# 또는 직접:
+#   PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 PYTHONPATH=src \
+#     python scripts/run_pipeline.py --config configs/dapd_m4_16gb.yaml
+# =============================================================================
+
+data:
+  datasets: ["pubmed_qa", "medmcqa"]
+  ood_datasets: ["bioasq"]
+  ood_max_samples: 200               # 100 → 200: BioASQ OOD 평가 샘플 확대
+  preprocessing_version: "v2"
+  seed: 42
+  max_train_samples: 5000            # 800 → 5000: effective steps 25 → 156
+  max_eval_samples: 300              # 64 → 300: 정확도 95% CI ±5.7%p 달성
+  max_length: 128                    # 64 → 128: 의료 문맥 2배, MPS +0.2 GB
+  num_proc: 1
+  cache_dir: "./cache/hf"
+  tokenized_cache_dir: "./runs/dapd_m4/cache/tokenized"
+  enable_map_cache: true
+
+adaptation:
+  enabled: true
+  teacher_model_name_or_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  output_dir: "./runs/dapd_m4/domain_teacher"
+  learning_rate: 0.00015
+  weight_decay: 0.01
+  num_train_epochs: 2                # 1 → 2: domain teacher 수렴 강화
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 32   # effective batch = 32
+  warmup_ratio: 0.03
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  evaluation_strategy: "no"
+  save_strategy: "epoch"
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  # 7개 모듈 — Adafactor optimizer state 절감으로 메모리 허용. MLP proj 포함 시
+  # teacher 도메인 적응 품질(knowledge transfer depth) 향상.
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"]
+  use_qlora: false
+  fp16: false
+  bf16: false                        # Trainer bf16 flag는 MPS에서 사용 불가
+  gradient_checkpointing: true       # activation re-computation으로 메모리 절감
+  max_grad_norm: 1.0
+  # Adafactor: AdamW 대비 optimizer state 43배 절감 (LoRA 7모듈 기준)
+  optim: "adafactor"
+
+distillation:
+  use_kl: true
+  student_model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  output_dir: "./runs/dapd_m4/distilled_student"
+  learning_rate: 0.0002              # 0.0001 → 0.0002: 표준값 복원
+  weight_decay: 0.01
+  num_train_epochs: 3                # 1 → 3: KD 수렴 + temperature schedule 충분히 진행
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 32   # effective batch = 32
+  warmup_ratio: 0.03
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  evaluation_strategy: "no"
+  save_strategy: "epoch"
+  gradient_checkpointing: true
+  alpha: 0.5                         # 0.7 → 0.5: KL loss 30%→50%, KD 효과 강화
+  temperature: 2.0                   # 시작 온도
+  temperature_schedule: "linear"    # linear decay T=2.0 → T=1.0
+  min_temperature: 1.0
+  allow_kl_fallback_to_ce: false
+  max_grad_norm: 1.0
+  # Adafactor: lm_head[152064,896] AdamW 2nd moment 545MB → 0.6MB (891× 절감)
+  optim: "adafactor"
+
+pruning:
+  enabled: true
+  method: "structured"
+  pruning_mode: "masking"
+  output_dir: "./runs/dapd_m4/pruned_student"
+  prune_ratio: 0.2                   # 0.1 → 0.2: 더 의미있는 압축 (sparsity 6% → ~12%)
+  beta: 0.5
+  calibration_batches: 8             # 2 → 8: importance score 정확도 향상
+  calibration_batch_size: 1
+  enable_attention_head_pruning: true   # FIX-02 적용: GQA(Qwen2.5) 지원 완료
+  enable_mlp_pruning: true
+  enable_layer_pruning: false
+  layer_prune_ratio: 0.0
+  min_heads_per_layer: 1
+  min_mlp_neurons: 32
+
+evaluation:
+  enabled: true
+  output_file: "./runs/dapd_m4/eval_metrics.json"
+  max_eval_samples: 300              # 64 → 300: 신뢰 구간 확보
+  batch_size: 1
+  max_new_tokens: 32                 # 16 → 32: 응답 품질 향상
+  generation_temperature: 0.0
+  num_latency_samples: 20
+  latency_seq_lens: [32, 64, 128]
+  latency_warmup_runs: 5
+  latency_benchmark_runs: 30
+  calibration_bins: 15
+  run_ood_test: false
+  ood_test_dataset: "bioasq"
+  ood_output_file: "./runs/dapd_m4/eval_metrics_ood.json"
+  ood_max_eval_samples: 100
+
+analysis:
+  enabled: true                      # 경량 분석만 활성화
+  output_dir: "./runs/dapd_m4/analysis"
+  max_samples: 100                   # M4 메모리 고려
+  # ── M4 에서 비활성화 (2개 모델 동시 로드 → 8GB+ MPS 사용 → CPU fallback → 극도로 느림)
+  run_teacher_distribution: false    # GPU 전용 (dapd_full.yaml 에서 실행)
+  run_teacher_calibration: false
+  run_teacher_information: false
+  run_temperature_analysis: false    # GPU 전용 (1.5B+0.5B 동시 로드 불가)
+  run_distillation_intervention: false
+  # ── M4 에서 활성화 가능한 경량 분석
+  run_pruning_patterns: true         # JSON 기반 분석, 모델 로드 없음
+  run_baseline_comparison: true      # 메모리 비용 없음
+  temperature_steps: 30
+  intervention_teacher_small: null
+  intervention_teacher_large: null
+
+runtime:
+  seed: 42
+  deterministic: true
+  device: "auto"                     # Apple Silicon → MPS 자동 선택
+  fp16: false                        # MPS fp16 미지원
+  bf16: false                        # MPS Trainer bf16 미지원
+  dataloader_num_workers: 0          # MPS multiprocessing OOM 방지
+  log_level: "INFO"

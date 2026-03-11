@@ -16,7 +16,7 @@ from .metrics import (
     compute_perplexity,
     compute_qa_metrics_with_calibration,
 )
-from .utils import collect_memory_stats, get_logger, get_model_disk_size_bytes, infer_device
+from .utils import collect_memory_stats, free_mps_memory, get_logger, get_model_disk_size_bytes, infer_device
 
 
 def evaluate_model(
@@ -29,12 +29,20 @@ def evaluate_model(
 ) -> dict[str, Any]:
     logger = get_logger("dapd.evaluation", getattr(runtime, "log_level", "INFO"))
 
-    student_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    device = infer_device(runtime.device)
+
+    # low_cpu_mem_usage: 로딩 시 CPU peak를 model_size 수준으로 억제한다.
+    # MPS 평가: student는 float32로 학습되었으므로 평가도 float32를 유지.
+    # (bfloat16 평가는 정확도에 영향을 줄 수 있으므로 float32 유지)
+    eval_load_kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    student_model = AutoModelForCausalLM.from_pretrained(model_path, **eval_load_kwargs)
     student_tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     if student_tokenizer.pad_token is None:
         student_tokenizer.pad_token = student_tokenizer.eos_token
 
-    device = infer_device(runtime.device)
     student_model.to(device)
     student_model.eval()
 
@@ -145,6 +153,12 @@ def evaluate_model(
     }
 
     if reference_model_path:
+        # [BUG-03 수정] reference(teacher) 로드 전에 student_model을 명시적으로 해제한다.
+        # M4 16GB Unified Memory에서 student(~2GB) + reference(~6GB)를 동시에
+        # 올리면 OOM이 발생하므로, student 평가가 완료된 시점에서 즉시 해제한다.
+        del student_model
+        free_mps_memory()
+
         ref = _evaluate_reference_performance(
             model_path=reference_model_path,
             prompts=eval_prompts,
@@ -205,7 +219,16 @@ def _evaluate_reference_performance(
     warmup_runs: int,
     timed_runs: int,
 ) -> dict[str, float]:
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    # MPS(Apple Silicon): reference(teacher)를 bfloat16으로 로드해 MPS 사용량 절감.
+    # student를 이미 del한 뒤이므로 MPS에 reference만 올라간다(6GB→3GB).
+    load_kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    if device.type == "mps" and torch.backends.mps.is_available():
+        load_kwargs["torch_dtype"] = torch.bfloat16
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -284,6 +307,8 @@ def _measure_generation_performance_on_prompts(
     if not prompts:
         return {
             "latency_ms": 0.0,
+            "p50_latency_ms": 0.0,
+            "p95_latency_ms": 0.0,
             "throughput_tokens_per_sec": 0.0,
             "tokens_processed": 0.0,
             "inference_time_sec": 0.0,

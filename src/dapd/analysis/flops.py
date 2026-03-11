@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 
@@ -63,16 +61,7 @@ def summarize_flops_reduction(
 
 def supports_flops_estimation() -> bool:
     try:
-        import fvcore  # noqa: F401
+        import importlib
+        return importlib.util.find_spec("fvcore") is not None
     except Exception:
         return False
-    return True
-
-
-def format_flops_for_report(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "flops_before_gmac": stats.get("flops_before_gmac"),
-        "flops_after_gmac": stats.get("flops_after_gmac"),
-        "flops_reduction_ratio": stats.get("flops_reduction_ratio"),
-        "flops_speedup_estimate": stats.get("flops_speedup_estimate"),
-    }

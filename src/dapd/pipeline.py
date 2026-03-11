@@ -32,8 +32,7 @@ from .distillation import (
 )
 from .evaluation import evaluate_model
 from .pruning import PruningArtifacts, run_structured_pruning
-from .utils import dump_json, dump_yaml, ensure_dir, get_logger, set_seed
-from .utils import infer_device
+from .utils import dump_json, dump_yaml, ensure_dir, get_logger, infer_device, set_seed
 
 
 class DAPDPipeline:
@@ -315,10 +314,11 @@ class DAPDPipeline:
                     analysis_results["teacher_distribution"] = analyze_teacher_distributions(
                         general_teacher_path=cfg.adaptation.teacher_model_name_or_path,
                         domain_teacher_path=adapt_artifacts.teacher_path,
-                        dataset=teacher_data.validation_lm,
-                        runtime=cfg.runtime,
-                        output_dir=cfg.analysis.output_dir,
+                        dataset=teacher_data.validation_text,
+                        lm_dataset=teacher_data.validation_lm,
+                        device=infer_device(cfg.runtime.device),
                         max_samples=cfg.analysis.max_samples,
+                        batch_size=1,
                     )
                 except Exception as exc:
                     logger.warning("teacher distribution analysis skipped: %s", exc)

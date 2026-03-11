@@ -1,6 +1,6 @@
 data:
   datasets: ["pubmed_qa", "medmcqa"]
-  preprocessing_version: "v1"
+  preprocessing_version: "v2"
   seed: 42
   max_train_samples: 100
   max_eval_samples: 32

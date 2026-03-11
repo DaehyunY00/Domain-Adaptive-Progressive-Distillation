@@ -151,7 +151,7 @@ def compute_qa_metrics_with_calibration(
         pred_norm = _normalize_text(generated)
         gold_norm = _normalize_text(gold)
 
-        if pred_norm == gold_norm:
+        if _answer_matches(pred_norm, gold_norm):
             exact += 1
             per_sample_correct.append(True)
         else:
@@ -317,6 +317,46 @@ def _normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^a-z0-9\s]", "", text)
     return text
+
+
+def _answer_matches(pred_norm: str, gold_norm: str) -> bool:
+    """Check whether the predicted text matches the gold answer.
+
+    Models often generate more than just the answer label (e.g., "yes, because ..."
+    instead of just "yes", or "a the patient should ..." instead of "a").
+    We therefore apply a lenient match strategy:
+
+    1. Exact match after normalization (handles the simple case).
+    2. Prefix match: pred starts with gold followed by a word boundary
+       (space, end of string). This handles "yes because..." matching "yes".
+    3. First-token match: compare only the first token of pred against the
+       entire gold when gold is a single token (A/B/C/D, yes/no/maybe).
+       This is the standard approach for multiple-choice and yes/no QA.
+    """
+    if not gold_norm:
+        return not pred_norm
+
+    # 1. Exact match
+    if pred_norm == gold_norm:
+        return True
+
+    gold_tokens = gold_norm.split()
+    pred_tokens = pred_norm.split()
+
+    if not pred_tokens:
+        return False
+
+    # 2. First-token match for single-token gold answers (A/B/C/D, yes/no/maybe)
+    if len(gold_tokens) == 1:
+        if pred_tokens[0] == gold_tokens[0]:
+            return True
+
+    # 3. Prefix match: pred starts with the full gold phrase
+    if len(pred_tokens) >= len(gold_tokens):
+        if pred_tokens[: len(gold_tokens)] == gold_tokens:
+            return True
+
+    return False
 
 
 def _token_f1(pred: str, gold: str) -> float:

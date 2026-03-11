@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import inspect
 import json
 import logging
 import platform
@@ -13,6 +14,7 @@ import numpy as np
 import psutil
 import torch
 import yaml
+from transformers import TrainingArguments
 
 _MPS_PEAK_ALLOCATED_BYTES = 0
 _MPS_BF16_HINT_EMITTED = False
@@ -118,6 +120,37 @@ def configure_model_for_training(model: torch.nn.Module, gradient_checkpointing:
     return previous_use_cache
 
 
+def resolve_training_strategy_kwargs(
+    evaluation_strategy: str,
+    save_strategy: str,
+) -> dict[str, Any]:
+    """Return TrainingArguments strategy kwargs compatible with transformers version."""
+    params = set(inspect.signature(TrainingArguments.__init__).parameters)
+    out: dict[str, Any] = {}
+
+    if "eval_strategy" in params:
+        out["eval_strategy"] = evaluation_strategy
+    elif "evaluation_strategy" in params:
+        out["evaluation_strategy"] = evaluation_strategy
+    else:
+        raise TypeError(
+            "TrainingArguments does not support eval/evaluation strategy arguments "
+            "in this transformers version."
+        )
+
+    if "save_strategy" in params:
+        out["save_strategy"] = save_strategy
+    elif "checkpoint_strategy" in params:
+        out["checkpoint_strategy"] = save_strategy
+    else:
+        raise TypeError(
+            "TrainingArguments does not support save/checkpoint strategy arguments "
+            "in this transformers version."
+        )
+
+    return out
+
+
 def restore_model_use_cache(model: torch.nn.Module, previous_use_cache: bool | None) -> None:
     if previous_use_cache is None:
         return
@@ -215,6 +248,32 @@ def collect_memory_stats(device: torch.device, reset_peak: bool = False) -> Memo
         device_allocated_mb=device_allocated / (1024 * 1024),
         peak_allocated_mb=peak_allocated / (1024 * 1024),
     )
+
+
+def free_mps_memory() -> None:
+    """MPS 디바이스 메모리를 명시적으로 해제한다.
+
+    model을 del한 직후 호출해 Apple Silicon Unified Memory 압박을 완화한다.
+    CUDA의 empty_cache()에 해당하는 MPS 전용 래퍼.
+    """
+    import gc as _gc
+
+    _gc.collect()
+    if torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
+def get_recommended_teacher_dtype(device: torch.device) -> "torch.dtype | None":
+    """디바이스에 맞는 teacher 모델 로드 dtype을 반환한다.
+
+    MPS(Apple Silicon)에서는 bfloat16으로 teacher를 로드해 메모리를 절반으로 줄인다.
+    teacher는 eval-only이므로 bfloat16 사용이 안전하다.
+    CUDA에서는 런타임 설정(fp16/bf16)을 따르므로 None을 반환해 호출자가 결정한다.
+    CPU에서는 None을 반환해 float32를 유지한다.
+    """
+    if device.type == "mps" and torch.backends.mps.is_available():
+        return torch.bfloat16
+    return None
 
 
 def _is_apple_silicon() -> bool:

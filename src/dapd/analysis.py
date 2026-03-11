@@ -161,12 +161,20 @@ def create_dynamics_callback(output_path: str) -> Any:
             logs: dict[str, Any] | None = None,
             **kwargs: Any,
         ) -> Any:
-            del args, control
+            del args
             logs = logs or {}
             trainer = kwargs.get("trainer")
+            # 1. Prefer temperature from the log dict itself: compute_loss calls
+            #    self.log({"temperature": ..., ...}) which triggers on_log with those
+            #    values directly in `logs`. _resolve_temperature falls back to
+            #    reconstructing the schedule from trainer attributes, but HF Trainer
+            #    does NOT pass `trainer` to on_log kwargs, so that path always returns
+            #    None. Read logs first, then fall back.
+            temp_from_logs = _to_float(logs.get("temperature"))
+            temperature = temp_from_logs if temp_from_logs is not None else _resolve_temperature(trainer=trainer, state=state)
             row = {
                 "global_step": int(getattr(state, "global_step", 0) or 0),
-                "temperature": _resolve_temperature(trainer=trainer, state=state),
+                "temperature": temperature,
                 "ce_loss": _to_float(logs.get("ce_loss")),
                 "kd_loss": _to_float(logs.get("kd_loss")),
                 "learning_rate": _to_float(logs.get("learning_rate", logs.get("lr"))),
@@ -335,7 +343,11 @@ def _collect_teacher_forward_stats(
     batch_size: int,
     logger: Any,
 ) -> dict[str, Any]:
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
     model.to(device)
     model.eval()
     logger.info("loaded teacher for analysis: %s", model_path)
@@ -504,7 +516,11 @@ def _scheduled_temperature(
 
 
 def _collect_model_sparsity(model_path: str, device: torch.device, logger: Any) -> dict[str, Any]:
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
     model.to(device)
     model.eval()
     logger.info("loaded model for pruning analysis: %s", model_path)
@@ -557,7 +573,11 @@ def _evaluate_qa_model(
     device: torch.device,
     max_samples: int,
 ) -> dict[str, float]:
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -603,4 +623,3 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
-

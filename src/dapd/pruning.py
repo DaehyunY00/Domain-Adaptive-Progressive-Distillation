@@ -83,7 +83,12 @@ def run_structured_pruning(
 
     output_dir = ensure_dir(config.output_dir)
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    # low_cpu_mem_usage: 로딩 시 CPU peak를 model_size 수준으로 억제한다.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
 
     device = infer_device(runtime.device)
@@ -429,6 +434,13 @@ def _prune_attention_heads(
 ) -> tuple[int, int, bool]:
     """Prune low-importance attention heads with physical fallback behavior.
 
+    Supports both standard MHA (Multi-Head Attention) and GQA (Grouped Query
+    Attention) architectures such as Qwen2.5, Llama-3, Mistral.
+    In MHA, q/k/v all have out_features == hidden_size.
+    In GQA, k/v have out_features == num_key_value_heads * head_dim < hidden_size.
+    Pruning is applied to Q heads (q_proj rows, o_proj cols); k/v masking is
+    only applied when k/v out_features equal hidden_size (MHA case).
+
     Returns:
       (pruned_heads, total_heads, physical_success)
     """
@@ -438,14 +450,20 @@ def _prune_attention_heads(
     pruned = 0
     total = 0
 
-    hidden_size = getattr(getattr(model, "config", None), "hidden_size", None)
-    num_heads = getattr(getattr(model, "config", None), "num_attention_heads", None)
+    model_cfg = getattr(model, "config", None)
+    hidden_size = getattr(model_cfg, "hidden_size", None)
+    num_heads = getattr(model_cfg, "num_attention_heads", None)
     if hidden_size is None or num_heads is None or num_heads <= 0:
         return 0, 0, False
 
     head_dim = hidden_size // num_heads
     if head_dim <= 0 or head_dim * num_heads != hidden_size:
         return 0, 0, False
+
+    # num_key_value_heads < num_attention_heads in GQA architectures.
+    # Fall back to num_heads (MHA) when the attribute is absent.
+    num_kv_heads: int = int(getattr(model_cfg, "num_key_value_heads", num_heads) or num_heads)
+    is_gqa = num_kv_heads != num_heads
 
     for q_name, q_proj in modules.items():
         if not q_name.endswith("q_proj"):
@@ -462,22 +480,36 @@ def _prune_attention_heads(
 
         if q_proj.out_features != hidden_size:
             continue
-        if k_proj.out_features != hidden_size or v_proj.out_features != hidden_size:
+
+        # For GQA: k/v out_features == num_kv_heads * head_dim (< hidden_size).
+        # For MHA: k/v out_features == hidden_size.
+        kv_expected = num_kv_heads * head_dim
+        if k_proj.out_features not in (hidden_size, kv_expected):
+            continue
+        if v_proj.out_features not in (hidden_size, kv_expected):
             continue
         if o_proj.in_features != hidden_size:
             continue
 
         q_weight = q_proj.weight.detach().abs().mean(dim=1)
-        k_weight = k_proj.weight.detach().abs().mean(dim=1)
-        v_weight = v_proj.weight.detach().abs().mean(dim=1)
         o_weight = o_proj.weight.detach().abs().mean(dim=0)
-        weight_score = (q_weight + k_weight + v_weight + o_weight) / 4.0
 
-        q_act = _activation_vector(activations.output, q_name, q_weight)
-        k_act = _activation_vector(activations.output, k_name, q_weight)
-        v_act = _activation_vector(activations.output, v_name, q_weight)
-        o_act = _activation_vector(activations.input, o_name, q_weight)
-        act_score = (q_act + k_act + v_act + o_act) / 4.0
+        if is_gqa:
+            # In GQA, score is derived only from Q and O projections since k/v
+            # channels don't correspond 1-to-1 with Q head channels.
+            weight_score = (q_weight + o_weight) / 2.0
+            q_act = _activation_vector(activations.output, q_name, q_weight)
+            o_act = _activation_vector(activations.input, o_name, q_weight)
+            act_score = (q_act + o_act) / 2.0
+        else:
+            k_weight = k_proj.weight.detach().abs().mean(dim=1)
+            v_weight = v_proj.weight.detach().abs().mean(dim=1)
+            weight_score = (q_weight + k_weight + v_weight + o_weight) / 4.0
+            q_act = _activation_vector(activations.output, q_name, q_weight)
+            k_act = _activation_vector(activations.output, k_name, q_weight)
+            v_act = _activation_vector(activations.output, v_name, q_weight)
+            o_act = _activation_vector(activations.input, o_name, q_weight)
+            act_score = (q_act + k_act + v_act + o_act) / 4.0
 
         channel_score = _combine_importance(weight_score, act_score, beta=float(config.beta))
         head_scores = channel_score.reshape(num_heads, head_dim).mean(dim=1)
@@ -490,10 +522,17 @@ def _prune_attention_heads(
             continue
 
         prune_heads = torch.topk(head_scores, k=n_prune, largest=False).indices.tolist()
-        channel_mask = torch.zeros(hidden_size, dtype=torch.bool, device=q_proj.weight.device)
+        # Q-channel mask spans all Q head channels (size == hidden_size).
+        q_channel_mask = torch.zeros(hidden_size, dtype=torch.bool, device=q_proj.weight.device)
         for head_idx in prune_heads:
             start = head_idx * head_dim
-            channel_mask[start : start + head_dim] = True
+            q_channel_mask[start : start + head_dim] = True
+
+        # KV-channel mask: only used in MHA (full hidden_size) case.
+        # In GQA k/v rows don't align with Q head indices so we skip k/v masking.
+        kv_channel_mask: torch.Tensor | None = None
+        if not is_gqa:
+            kv_channel_mask = q_channel_mask
 
         plans.append(
             {
@@ -506,7 +545,8 @@ def _prune_attention_heads(
                 "v_proj": v_proj,
                 "o_proj": o_proj,
                 "prune_heads": prune_heads,
-                "channel_mask": channel_mask,
+                "channel_mask": q_channel_mask,
+                "kv_channel_mask": kv_channel_mask,
                 "layer_idx": _extract_layer_index(q_name),
             }
         )
@@ -516,6 +556,8 @@ def _prune_attention_heads(
                     "module": q_name,
                     "layer_index": _extract_layer_index(q_name),
                     "num_heads": int(num_heads),
+                    "num_kv_heads": int(num_kv_heads),
+                    "is_gqa": bool(is_gqa),
                     "pruned_heads": [int(x) for x in prune_heads],
                     "head_scores": [float(x) for x in head_scores.detach().cpu().tolist()],
                 }
@@ -727,19 +769,25 @@ def _apply_attention_masking(plans: list[dict[str, Any]]) -> None:
         k_proj = plan["k_proj"]
         v_proj = plan["v_proj"]
         o_proj = plan["o_proj"]
+        # Q-channel mask (always hidden_size channels).
         channel_mask = plan["channel_mask"]
+        # KV-channel mask: same as Q mask for MHA; None for GQA
+        # (k/v rows don't align with Q head channels in GQA).
+        kv_channel_mask = plan.get("kv_channel_mask", channel_mask)
 
         with torch.no_grad():
             q_proj.weight[channel_mask, :] = 0.0
-            k_proj.weight[channel_mask, :] = 0.0
-            v_proj.weight[channel_mask, :] = 0.0
             o_proj.weight[:, channel_mask] = 0.0
             if q_proj.bias is not None:
                 q_proj.bias[channel_mask] = 0.0
-            if k_proj.bias is not None:
-                k_proj.bias[channel_mask] = 0.0
-            if v_proj.bias is not None:
-                v_proj.bias[channel_mask] = 0.0
+
+            if kv_channel_mask is not None:
+                k_proj.weight[kv_channel_mask, :] = 0.0
+                v_proj.weight[kv_channel_mask, :] = 0.0
+                if k_proj.bias is not None:
+                    k_proj.bias[kv_channel_mask] = 0.0
+                if v_proj.bias is not None:
+                    v_proj.bias[kv_channel_mask] = 0.0
 
 
 def _apply_mlp_masking(plans: list[dict[str, Any]]) -> None:
